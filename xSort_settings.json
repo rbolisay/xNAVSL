@@ -1,0 +1,11 @@
+{
+  "compression_method": "gzip", 
+  "csv_path": "", 
+  "expected_duplicates": "2", 
+  "max_compression_threads": "1", 
+  "sort_order": "Ascending", 
+  "sort_range": "6-8", 
+  "target_dir": "/data/JOB/3190/backup_processed/BUP001A", 
+  "window_geometry": "1126x1175+1152+265", 
+  "window_state": "normal"
+}
