@@ -13,11 +13,11 @@ import os
 import json
 import re
 import threading
-import time
 import Queue
 
 import Tkinter as tk
 import tkFileDialog
+import tkMessageBox
 import ttk
 import ScrolledText
 
@@ -27,7 +27,10 @@ default_P211_DIR = "/usr/local/trinop/dbase/links/currentjob/P211"
 default_BACKUP_DIR = "/usr/local/trinop/dbase/links/backup_processed"
 default_FESB_DIR = "/usr/local/trinop/dbase/links/fes_backup"
 default_OUTPUT_CSV = "/usr/local/trinop/qcfiles/Misc/xp1p2.csv"
-SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".xp1p2_settings.json")
+DEFAULT_DATA_DIR = "/usr/local/trinop/dbase/links/qcfiles/Misc/xp1p2"
+SESSION_FILE = os.path.join(DEFAULT_DATA_DIR, "session.json")
+CONFIG_VERSION = 1
+CACHE_VERSION = 1
 
 # Define error strings that should be shown in red.
 error_strings = {"Missing!", "SP range BAD", "Missing Backup!", "Missing FESB!", "mismatch", "Backup subline BAD"}
@@ -37,6 +40,192 @@ COMPRESSED_EXTENSIONS = (".gz", ".bz2")
 GUI_BACKGROUND_COLOR = "#B4C8E1"  # Blue Aura
 BUTTON_BACKGROUND_COLOR = "#8DA9CC" # Distinct, slightly darker blue
 BUTTON_TEXT_COLOR = "black"
+
+def ensure_data_dir():
+    """Creates the xp1p2 data directory if it does not exist."""
+    if not os.path.isdir(DEFAULT_DATA_DIR):
+        try:
+            os.makedirs(DEFAULT_DATA_DIR)
+        except Exception as e:
+            print("Error creating data directory {}: {}".format(DEFAULT_DATA_DIR, e))
+
+def safe_config_basename(name):
+    """Returns a filesystem-safe configuration basename."""
+    raw = (name or "").strip() or "default"
+    safe = re.sub(r'[/\\:*?"<>|]+', "_", raw).strip("._ ") or "default"
+    if safe.lower().endswith(".json"):
+        safe = safe[:-5].strip("._ ") or "default"
+    return safe[:120]
+
+def config_path_for_name(name, save_dir=None):
+    """Builds the JSON config path for a configuration name."""
+    directory = save_dir or DEFAULT_DATA_DIR
+    return os.path.join(directory, safe_config_basename(name) + ".json")
+
+def cache_path_for_name(name):
+    """Builds the QC cache JSON path for a configuration name."""
+    ensure_data_dir()
+    return os.path.join(DEFAULT_DATA_DIR, safe_config_basename(name) + "_qc_cache.json")
+
+def directory_fingerprint(directory):
+    """Lightweight fingerprint for a directory listing."""
+    try:
+        entries = []
+        for filename in os.listdir(directory):
+            path = os.path.join(directory, filename)
+            if os.path.isfile(path):
+                stat = os.stat(path)
+                entries.append((filename, stat.st_mtime, stat.st_size))
+        entries.sort()
+        if not entries:
+            return "empty"
+        return "count={};max_mtime={}".format(len(entries), max(entry[1] for entry in entries))
+    except Exception:
+        return "error"
+
+def get_sequence_file_signature(directory, extension, seq_num, file_value):
+    """Builds a cache signature for one sequence file selection."""
+    if file_value == "Missing!":
+        return {"status": "missing"}
+    if file_value == "Multiple Files!":
+        candidates = []
+        try:
+            for filename in os.listdir(directory):
+                if filename.endswith(extension) and filename[:4].isdigit():
+                    try:
+                        if int(filename[:4]) != seq_num:
+                            continue
+                    except ValueError:
+                        continue
+                    path = os.path.join(directory, filename)
+                    stat = os.stat(path)
+                    candidates.append({"path": path, "mtime": stat.st_mtime, "size": stat.st_size})
+        except Exception:
+            pass
+        candidates.sort(key=lambda item: item["path"])
+        return {"status": "multiple", "candidates": candidates}
+    try:
+        stat = os.stat(file_value)
+        return {"status": "ok", "path": file_value, "mtime": stat.st_mtime, "size": stat.st_size}
+    except Exception:
+        return {"status": "missing"}
+
+def build_sequence_inputs(p111_sig, p211_sig, sub_p111, sub_p211, backup_dir, fesb_dir):
+    """Builds the input signature stored with each cached QC row."""
+    expected_sublines = []
+    for subline in (sub_p111, sub_p211):
+        if subline not in ["Missing!", "Multiple Files!"] and subline not in expected_sublines:
+            expected_sublines.append(subline)
+    return {
+        "p111": p111_sig,
+        "p211": p211_sig,
+        "backup_dir_fp": directory_fingerprint(backup_dir),
+        "fesb_dir_fp": directory_fingerprint(fesb_dir),
+        "expected_sublines": expected_sublines,
+    }
+
+def sequence_inputs_unchanged(cached_inputs, current_inputs):
+    """Returns True when cached inputs still match the current filesystem state."""
+    if not isinstance(cached_inputs, dict) or not isinstance(current_inputs, dict):
+        return False
+    for key in ("p111", "p211", "backup_dir_fp", "fesb_dir_fp"):
+        if cached_inputs.get(key) != current_inputs.get(key):
+            return False
+    return True
+
+def run_config_browse_dialog(parent):
+    """Load file vs save-folder choice."""
+    result = [None]
+    dlg = tk.Toplevel(parent)
+    dlg.title("Configuration")
+    dlg.configure(bg=GUI_BACKGROUND_COLOR)
+    dlg.transient(parent)
+    dlg.grab_set()
+
+    def finish(value):
+        result[0] = value
+        dlg.destroy()
+
+    tk.Label(
+        dlg,
+        text="Choose an action:",
+        bg=GUI_BACKGROUND_COLOR,
+        foreground="black",
+    ).pack(padx=22, pady=(14, 10))
+    for text, value in (
+        ("Load configuration file...", "load"),
+        ("Choose save folder...", "folder"),
+        ("Cancel", None),
+    ):
+        tk.Button(
+            dlg,
+            text=text,
+            command=lambda v=value: finish(v),
+            background=BUTTON_BACKGROUND_COLOR,
+            foreground=BUTTON_TEXT_COLOR,
+            padx=12,
+            pady=4,
+        ).pack(fill=tk.X, padx=20, pady=3)
+    parent.wait_window(dlg)
+    return result[0]
+
+class QCCache(object):
+    """Per-configuration QC result cache stored under DEFAULT_DATA_DIR."""
+
+    def __init__(self, cache_path):
+        self.cache_path = cache_path
+        self.data = self._load()
+
+    def _load(self):
+        if not os.path.isfile(self.cache_path):
+            return {"version": CACHE_VERSION, "paths": {}, "sequences": {}}
+        try:
+            f = open(self.cache_path, "r")
+            data = json.load(f)
+            f.close()
+        except Exception as e:
+            print("Error loading QC cache {}: {}".format(self.cache_path, e))
+            return {"version": CACHE_VERSION, "paths": {}, "sequences": {}}
+        if not isinstance(data, dict):
+            return {"version": CACHE_VERSION, "paths": {}, "sequences": {}}
+        data.setdefault("paths", {})
+        data.setdefault("sequences", {})
+        return data
+
+    def ensure_paths(self, p111_dir, p211_dir, backup_dir, fesb_dir):
+        """Clears cached sequences when configured directories change."""
+        current_paths = {
+            "p111_dir": p111_dir,
+            "p211_dir": p211_dir,
+            "backup_dir": backup_dir,
+            "fesb_dir": fesb_dir,
+        }
+        if self.data.get("paths") != current_paths:
+            self.data["paths"] = current_paths
+            self.data["sequences"] = {}
+
+    def get_cached_row(self, seq_key, current_inputs):
+        entry = self.data.get("sequences", {}).get(seq_key)
+        if not entry:
+            return None
+        if not sequence_inputs_unchanged(entry.get("inputs"), current_inputs):
+            return None
+        return entry.get("result_row")
+
+    def put_row(self, seq_key, inputs, result_row):
+        self.data.setdefault("sequences", {})[seq_key] = {
+            "inputs": inputs,
+            "result_row": result_row,
+        }
+
+    def save(self):
+        ensure_data_dir()
+        try:
+            f = open(self.cache_path, "w")
+            json.dump(self.data, f, indent=2, sort_keys=True)
+            f.close()
+        except Exception as e:
+            print("Error saving QC cache {}: {}".format(self.cache_path, e))
 
 def get_files_in_range(directory, extension, seq_start, seq_end):
     """Retrieves files in the directory matching the sequence range."""
@@ -166,6 +355,15 @@ def check_fesb_exists(sequence, fesb_dir):
     seq_str = "{:04d}".format(sequence)
     return "FESB GOOD" if directory_contains_token(fesb_dir, "rt_{}".format(seq_str)) else "Missing FESB!"
 
+def check_subline_xcheck(sub_p111, sub_p211):
+    """Compares P111 and P211 sublines."""
+    invalid = {"Missing!", "Multiple Files!"}
+    if sub_p111 in invalid or sub_p211 in invalid:
+        return "Missing!"
+    if sub_p111.lower() == sub_p211.lower():
+        return "Match"
+    return "mismatch"
+
 def save_csv(file_path, data, output_queue):
     """Saves the processed data to a CSV file."""
     try:
@@ -173,7 +371,7 @@ def save_csv(file_path, data, output_queue):
         if not os.path.exists(directory):
             os.makedirs(directory)
         with open(file_path, "w") as f:
-            f.write("Sequence Number,Filename P111,Line Name P111,Subline P111,FSP P111,LSP P111,"
+            f.write("Sequence No.,Filename P111,Line Name P111,Subline P111,FSP P111,LSP P111,"
                     "Filename P211,Line Name P211,Subline P211,FSP P211,LSP P211,Subline XCheck,SP Range XCheck,Backup XCheck,FESB XCheck\n")
             for row in data:
                 f.write(",".join(map(str, row)) + "\n")
@@ -183,7 +381,7 @@ def save_csv(file_path, data, output_queue):
 
 class QCWorker(threading.Thread):
     """Worker thread that performs the QC process."""
-    def __init__(self, p111_dir, p211_dir, backup_dir, fesb_dir, output_csv, seq_range, output_queue):
+    def __init__(self, p111_dir, p211_dir, backup_dir, fesb_dir, output_csv, seq_range, cache_path, output_queue):
         threading.Thread.__init__(self)
         self.p111_dir = p111_dir
         self.p211_dir = p211_dir
@@ -191,6 +389,7 @@ class QCWorker(threading.Thread):
         self.fesb_dir = fesb_dir
         self.output_csv = output_csv
         self.seq_range = seq_range
+        self.cache_path = cache_path
         self.output_queue = output_queue
 
     def run(self):
@@ -200,51 +399,70 @@ class QCWorker(threading.Thread):
             self.output_queue.put(("status", "Invalid sequence range! Please use format '1-5'\n"))
             return
         self.output_queue.put(("status", "Starting QC process for sequence range {} to {}\n".format(seq_start, seq_end)))
+        qc_cache = QCCache(self.cache_path)
+        qc_cache.ensure_paths(self.p111_dir, self.p211_dir, self.backup_dir, self.fesb_dir)
         p111_files = get_files_in_range(self.p111_dir, ".p111", seq_start, seq_end)
         p211_files = get_files_in_range(self.p211_dir, ".p211", seq_start, seq_end)
         extracted_data = []
+        reused_count = 0
+        recomputed_count = 0
         for seq in range(seq_start, seq_end + 1):
+            seq_key = "{:04d}".format(seq)
             p111_file = p111_files.get(seq, "Missing!")
             p211_file = p211_files.get(seq, "Missing!")
-            # Get shotpoint values preserving file order for display, and numeric min/max for checking.
-            fsp_p111_disp, lsp_p111_disp, fsp_p111_num, lsp_p111_num, line_p111, sub_p111 = \
-                extract_shotpoints(p111_file, "S1", 4)
-            fsp_p211_disp, lsp_p211_disp, fsp_p211_num, lsp_p211_num, line_p211, sub_p211 = \
-                extract_shotpoints(p211_file, "E2", 6)
-            backup_xcheck = check_backup_exists(sub_p111, sub_p211, self.backup_dir)
-            fesb_xcheck = check_fesb_exists(seq, self.fesb_dir)
-            # Implement SP range check using the numeric min and max values.
-            try:
-                if int(fsp_p111_num) >= int(fsp_p211_num) and int(lsp_p111_num) <= int(lsp_p211_num):
-                    sp_range_xcheck = "SP range GOOD"
-                else:
+            p111_sig = get_sequence_file_signature(self.p111_dir, ".p111", seq, p111_file)
+            p211_sig = get_sequence_file_signature(self.p211_dir, ".p211", seq, p211_file)
+            partial_inputs = build_sequence_inputs(
+                p111_sig, p211_sig, "Missing!", "Missing!", self.backup_dir, self.fesb_dir
+            )
+            cached_row = qc_cache.get_cached_row(seq_key, partial_inputs)
+            if cached_row is not None:
+                result_line = cached_row
+                reused_count += 1
+            else:
+                fsp_p111_disp, lsp_p111_disp, fsp_p111_num, lsp_p111_num, line_p111, sub_p111 = \
+                    extract_shotpoints(p111_file, "S1", 4)
+                fsp_p211_disp, lsp_p211_disp, fsp_p211_num, lsp_p211_num, line_p211, sub_p211 = \
+                    extract_shotpoints(p211_file, "E2", 6)
+                backup_xcheck = check_backup_exists(sub_p111, sub_p211, self.backup_dir)
+                fesb_xcheck = check_fesb_exists(seq, self.fesb_dir)
+                subline_xcheck = check_subline_xcheck(sub_p111, sub_p211)
+                try:
+                    if int(fsp_p111_num) >= int(fsp_p211_num) and int(lsp_p111_num) <= int(lsp_p211_num):
+                        sp_range_xcheck = "SP range GOOD"
+                    else:
+                        sp_range_xcheck = "SP range BAD"
+                except Exception:
                     sp_range_xcheck = "SP range BAD"
-            except Exception:
-                sp_range_xcheck = "SP range BAD"
-            # Build the result row using display values.
-            result_line = [
-                "{:04d}".format(seq),
-                os.path.basename(p111_file),
-                line_p111,
-                sub_p111,
-                fsp_p111_disp,
-                lsp_p111_disp,
-                os.path.basename(p211_file),
-                line_p211,
-                sub_p211,
-                fsp_p211_disp,
-                lsp_p211_disp,
-                "Match",  # Subline XCheck currently hardcoded as "Match"
-                sp_range_xcheck,
-                backup_xcheck,
-                fesb_xcheck
-            ]
+                result_line = [
+                    seq_key,
+                    os.path.basename(p111_file),
+                    line_p111,
+                    sub_p111,
+                    fsp_p111_disp,
+                    lsp_p111_disp,
+                    os.path.basename(p211_file),
+                    line_p211,
+                    sub_p211,
+                    fsp_p211_disp,
+                    lsp_p211_disp,
+                    subline_xcheck,
+                    sp_range_xcheck,
+                    backup_xcheck,
+                    fesb_xcheck
+                ]
+                inputs = build_sequence_inputs(
+                    p111_sig, p211_sig, sub_p111, sub_p211, self.backup_dir, self.fesb_dir
+                )
+                qc_cache.put_row(seq_key, inputs, result_line)
+                recomputed_count += 1
             extracted_data.append(result_line)
-            # Send the row as a tuple ("row", list_of_values)
             self.output_queue.put(("row", result_line))
-            time.sleep(0.1)  # simulate processing delay
 
-        # Modify the output CSV filename to include the sequence range.
+        qc_cache.save()
+        self.output_queue.put(("status", "Reused cache: {} sequence(s), recomputed: {} sequence(s).\n".format(
+            reused_count, recomputed_count
+        )))
         base, ext = os.path.splitext(self.output_csv)
         output_csv_modified = base + "_" + self.seq_range + ext
         save_csv(output_csv_modified, extracted_data, self.output_queue)
@@ -268,6 +486,7 @@ class QCAppPanel(tk.Frame):
         self.controls_frame.grid(row=0, column=0, sticky="nw", padx=5, pady=5)
 
         # Define StringVars for paths and sequence range.
+        self.config_name = tk.StringVar(value="default")
         self.p111_dir = tk.StringVar(value=default_P111_DIR)
         self.p211_dir = tk.StringVar(value=default_P211_DIR)
         self.backup_dir = tk.StringVar(value=default_BACKUP_DIR)
@@ -275,10 +494,22 @@ class QCAppPanel(tk.Frame):
         self.output_csv = tk.StringVar(value=default_OUTPUT_CSV)
         self.seq_range = tk.StringVar(value="1-5")
         self._saved_geometry = None
-        self.load_settings()
+        self.current_config_path = None
+        self.default_save_dir = DEFAULT_DATA_DIR
+        ensure_data_dir()
+        self.load_session_on_startup()
 
         # Populate the controls frame.
         row = 0
+        # Configuration Name
+        tk.Label(self.controls_frame, text="Configuration Name:", background=GUI_BACKGROUND_COLOR, foreground="black").grid(row=row, column=0, sticky="w")
+        tk.Entry(self.controls_frame, textvariable=self.config_name, width=50).grid(row=row, column=1)
+        browse_load_button = tk.Button(self.controls_frame, text="Browse/Load", command=self.browse_load_config, background=BUTTON_BACKGROUND_COLOR, foreground=BUTTON_TEXT_COLOR)
+        browse_load_button.grid(row=row, column=2, padx=(0, 2))
+        save_config_button = tk.Button(self.controls_frame, text="Save", command=self.save_config, background=BUTTON_BACKGROUND_COLOR, foreground=BUTTON_TEXT_COLOR)
+        save_config_button.grid(row=row, column=3, padx=(2, 0))
+
+        row += 1
         # P111 Directory
         tk.Label(self.controls_frame, text="P111 Directory:", background=GUI_BACKGROUND_COLOR, foreground="black").grid(row=row, column=0, sticky="w")
         tk.Entry(self.controls_frame, textvariable=self.p111_dir, width=50).grid(row=row, column=1)
@@ -341,7 +572,7 @@ class QCAppPanel(tk.Frame):
 
 
         # Define the columns.
-        self.columns = ["Sequence Number", "Filename P111", "Line Name P111", "Subline P111",
+        self.columns = ["Sequence No.", "Filename P111", "Line Name P111", "Subline P111",
                         "FSP P111", "LSP P111", "Filename P211", "Line Name P211", "Subline P211",
                         "FSP P211", "LSP P211", "Subline XCheck", "SP Range XCheck", "Backup XCheck", "FESB XCheck"]
 
@@ -380,28 +611,120 @@ class QCAppPanel(tk.Frame):
         if self._geometry_save_widget is None:
             self.bind("<Destroy>", self._on_embed_destroy)
 
-    def load_settings(self):
-        """Loads the last-used GUI settings from disk."""
-        if not os.path.isfile(SETTINGS_FILE):
+    def build_config_dict(self):
+        """Builds the JSON payload for the current configuration."""
+        geometry = None
+        if self._geometry_save_widget is not None:
+            try:
+                geometry = self._geometry_save_widget.geometry()
+            except Exception:
+                geometry = None
+        return {
+            "version": CONFIG_VERSION,
+            "configuration_name": self.config_name.get().strip(),
+            "p111_dir": self.p111_dir.get(),
+            "p211_dir": self.p211_dir.get(),
+            "backup_dir": self.backup_dir.get(),
+            "fesb_dir": self.fesb_dir.get(),
+            "output_csv": self.output_csv.get(),
+            "seq_range": self.seq_range.get(),
+            "window_geometry": geometry,
+            "default_save_dir": self.default_save_dir,
+            "last_config_path": self.current_config_path,
+        }
+
+    def apply_config_dict(self, data, apply_window_layout=True):
+        """Applies a loaded configuration dictionary to the UI."""
+        if not isinstance(data, dict):
+            return
+        name = (data.get("configuration_name") or "").strip()
+        if name:
+            self.config_name.set(name)
+        self.p111_dir.set(data.get("p111_dir", default_P111_DIR))
+        self.p211_dir.set(data.get("p211_dir", default_P211_DIR))
+        self.backup_dir.set(data.get("backup_dir", default_BACKUP_DIR))
+        self.fesb_dir.set(data.get("fesb_dir", default_FESB_DIR))
+        self.output_csv.set(data.get("output_csv", default_OUTPUT_CSV))
+        self.seq_range.set(data.get("seq_range", "1-5"))
+        save_dir = data.get("default_save_dir")
+        if save_dir and os.path.isdir(save_dir):
+            self.default_save_dir = save_dir
+        last_path = data.get("last_config_path")
+        if last_path:
+            self.current_config_path = last_path
+        if apply_window_layout:
+            geometry = data.get("window_geometry")
+            if geometry and self._geometry_save_widget is not None:
+                self._saved_geometry = geometry
+                try:
+                    self._geometry_save_widget.geometry(geometry)
+                except Exception:
+                    pass
+
+    def get_cache_path(self):
+        """Returns the QC cache file path for the active configuration name."""
+        return cache_path_for_name(self.config_name.get())
+
+    def load_config_file(self, path):
+        """Loads a configuration JSON file."""
+        path = os.path.abspath(path)
+        f = open(path, "r")
+        data = json.load(f)
+        f.close()
+        self.current_config_path = path
+        self.default_save_dir = os.path.dirname(path)
+        self.apply_config_dict(data, apply_window_layout=True)
+        if not (data.get("configuration_name") or "").strip():
+            self.config_name.set(safe_config_basename(os.path.basename(path)))
+        self.save_session()
+
+    def load_session_on_startup(self):
+        """Loads the last session or configuration on startup."""
+        if not os.path.isfile(SESSION_FILE):
             return
         try:
-            f = open(SETTINGS_FILE, "r")
-            settings = json.load(f)
+            f = open(SESSION_FILE, "r")
+            session = json.load(f)
             f.close()
         except Exception as e:
-            print("Error loading settings from {}: {}".format(SETTINGS_FILE, e))
+            print("Error loading session from {}: {}".format(SESSION_FILE, e))
             return
-        self.p111_dir.set(settings.get("p111_dir", default_P111_DIR))
-        self.p211_dir.set(settings.get("p211_dir", default_P211_DIR))
-        self.backup_dir.set(settings.get("backup_dir", default_BACKUP_DIR))
-        self.fesb_dir.set(settings.get("fesb_dir", default_FESB_DIR))
-        self.output_csv.set(settings.get("output_csv", default_OUTPUT_CSV))
-        self.seq_range.set(settings.get("seq_range", "1-5"))
-        self._saved_geometry = settings.get("window_geometry")
+        save_dir = session.get("default_save_dir")
+        if save_dir and os.path.isdir(save_dir):
+            self.default_save_dir = save_dir
+        path = session.get("last_config_path")
+        if path and os.path.isfile(path):
+            try:
+                self.load_config_file(path)
+                return
+            except Exception as e:
+                print("Error loading last config {}: {}".format(path, e))
+        self._saved_geometry = session.get("window_geometry")
+        if session.get("p111_dir"):
+            self.p111_dir.set(session.get("p111_dir", default_P111_DIR))
+            self.p211_dir.set(session.get("p211_dir", default_P211_DIR))
+            self.backup_dir.set(session.get("backup_dir", default_BACKUP_DIR))
+            self.fesb_dir.set(session.get("fesb_dir", default_FESB_DIR))
+            self.output_csv.set(session.get("output_csv", default_OUTPUT_CSV))
+            self.seq_range.set(session.get("seq_range", "1-5"))
+            name = session.get("configuration_name")
+            if name:
+                self.config_name.set(name)
 
-    def save_settings(self):
-        """Saves the current GUI settings to disk."""
-        settings = {
+    def save_session(self):
+        """Persists session data including last loaded configuration."""
+        ensure_data_dir()
+        geometry = None
+        if self._geometry_save_widget is not None:
+            try:
+                geometry = self._geometry_save_widget.geometry()
+            except Exception:
+                geometry = None
+        session = {
+            "last_config_path": self.current_config_path,
+            "default_save_dir": self.default_save_dir,
+            "window_geometry": geometry,
+            "configuration_name": self.config_name.get().strip(),
             "p111_dir": self.p111_dir.get(),
             "p211_dir": self.p211_dir.get(),
             "backup_dir": self.backup_dir.get(),
@@ -409,17 +732,81 @@ class QCAppPanel(tk.Frame):
             "output_csv": self.output_csv.get(),
             "seq_range": self.seq_range.get(),
         }
-        if self._geometry_save_widget is not None:
-            try:
-                settings["window_geometry"] = self._geometry_save_widget.geometry()
-            except Exception:
-                settings["window_geometry"] = None
         try:
-            f = open(SETTINGS_FILE, "w")
-            json.dump(settings, f, indent=2, sort_keys=True)
+            f = open(SESSION_FILE, "w")
+            json.dump(session, f, indent=2, sort_keys=True)
             f.close()
         except Exception as e:
-            print("Error saving settings to {}: {}".format(SETTINGS_FILE, e))
+            print("Error saving session to {}: {}".format(SESSION_FILE, e))
+
+    def browse_load_config(self):
+        """Browse/load dialog: load a config file or choose a save folder."""
+        choice = run_config_browse_dialog(self.winfo_toplevel())
+        if choice == "load":
+            initialdir = self.default_save_dir if os.path.isdir(self.default_save_dir) else DEFAULT_DATA_DIR
+            path = tkFileDialog.askopenfilename(
+                parent=self.winfo_toplevel(),
+                title="Load configuration",
+                initialdir=initialdir,
+                filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
+            )
+            if path:
+                try:
+                    self.load_config_file(path)
+                    tkMessageBox.showinfo("Loaded", "Configuration loaded:\n{}".format(path))
+                except Exception as ex:
+                    tkMessageBox.showerror("Load error", str(ex))
+        elif choice == "folder":
+            initialdir = self.default_save_dir if os.path.isdir(self.default_save_dir) else DEFAULT_DATA_DIR
+            directory = tkFileDialog.askdirectory(
+                parent=self.winfo_toplevel(),
+                title="Choose folder for saving configurations",
+                initialdir=initialdir,
+            )
+            if directory:
+                self.default_save_dir = os.path.abspath(directory)
+                self.save_session()
+                tkMessageBox.showinfo("Save folder", "Configurations will save to:\n{}".format(self.default_save_dir))
+
+    def save_config(self):
+        """Saves the current configuration to JSON."""
+        name = safe_config_basename(self.config_name.get())
+        self.config_name.set(name)
+        if not os.path.isdir(self.default_save_dir):
+            try:
+                os.makedirs(self.default_save_dir)
+            except Exception:
+                self.default_save_dir = DEFAULT_DATA_DIR
+                ensure_data_dir()
+        path = config_path_for_name(name, self.default_save_dir)
+        payload = self.build_config_dict()
+        payload["last_config_path"] = path
+        try:
+            f = open(path, "w")
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.close()
+            self.current_config_path = path
+            self.save_session()
+            tkMessageBox.showinfo("Saved", "Configuration saved:\n{}".format(path))
+        except Exception as ex:
+            tkMessageBox.showerror("Save error", str(ex))
+
+    def load_settings(self):
+        """Deprecated: retained for compatibility; session loader is used instead."""
+        self.load_session_on_startup()
+
+    def save_settings(self):
+        """Saves session state and current configuration when a path is known."""
+        self.save_session()
+        if self.current_config_path:
+            try:
+                payload = self.build_config_dict()
+                payload["last_config_path"] = self.current_config_path
+                f = open(self.current_config_path, "w")
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.close()
+            except Exception as e:
+                print("Error auto-saving config {}: {}".format(self.current_config_path, e))
 
     def on_root_close(self):
         """Standalone window: save and destroy the Tk root."""
@@ -490,7 +877,8 @@ class QCAppPanel(tk.Frame):
         self.status_text.configure(state="disabled")
         # Start the QC process in a new thread.
         worker = QCWorker(self.p111_dir.get(), self.p211_dir.get(), self.backup_dir.get(),
-                          self.fesb_dir.get(), self.output_csv.get(), self.seq_range.get(), self.output_queue)
+                          self.fesb_dir.get(), self.output_csv.get(), self.seq_range.get(),
+                          self.get_cache_path(), self.output_queue)
         worker.start()
 
     def process_queue(self):
