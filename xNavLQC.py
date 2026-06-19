@@ -6,11 +6,14 @@
 # Modified to implement per-pattern "Max Duplicate" control, replacing the global setting.
 # Modified to add in-place Treeview editing, multiple selection, and styled headers.
 # Modified to fix startup confirmation prompt by creating a silent clear method.
+# Modified to make sequence folders clickable (open files in Firefox) with right-click Open in Explorer.
 import os
 import glob
 import math
 import json
 import re
+import subprocess
+import urllib
 import Tkinter as tk
 import tkFileDialog
 import tkMessageBox
@@ -579,6 +582,60 @@ class SequenceCheckerApp(tk.Frame):
         self.warning_text.insert(tk.END, text)
         self.warning_text.config(state=tk.DISABLED, fg=fg_color, bg=self.BLUE_AURA_BG)
 
+    def _path_to_file_uri(self, path):
+        abs_path = os.path.abspath(path)
+        return "file://" + urllib.pathname2url(abs_path)
+
+    def open_folder_files_in_firefox(self, folder_path):
+        if not os.path.isdir(folder_path):
+            tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
+            return
+        try:
+            files = sorted(
+                os.path.join(folder_path, name)
+                for name in os.listdir(folder_path)
+                if os.path.isfile(os.path.join(folder_path, name))
+            )
+        except OSError as e:
+            tkMessageBox.showerror("Error", "Could not read folder:\n" + str(e))
+            return
+        if not files:
+            tkMessageBox.showinfo("No Files", "No files found in folder:\n" + folder_path)
+            return
+        file_uris = [self._path_to_file_uri(f) for f in files]
+        try:
+            subprocess.Popen(
+                ["firefox"] + file_uris,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except OSError as e:
+            tkMessageBox.showerror("Error", "Could not launch Firefox:\n" + str(e))
+
+    def open_folder_in_explorer(self, folder_path):
+        if not os.path.isdir(folder_path):
+            tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
+            return
+        try:
+            subprocess.Popen(
+                ["xdg-open", folder_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except OSError as e:
+            tkMessageBox.showerror("Error", "Could not open folder in file manager:\n" + str(e))
+
+    def show_folder_context_menu(self, event, folder_path):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Open in Explorer",
+            command=lambda: self.open_folder_in_explorer(folder_path)
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def scan_sequences(self):
         for widget in self.results_frame.winfo_children():
             widget.destroy()
@@ -662,7 +719,7 @@ class SequenceCheckerApp(tk.Frame):
 
             if not sequence_ok:
                 status = "Issue (" + issue_type + ")"
-                results.append((subdir_name, status))
+                results.append((subdir_name, status, seq_path))
                 problem_sequences.append(subdir_name + " (" + issue_type + ")")
                 continue
 
@@ -671,7 +728,7 @@ class SequenceCheckerApp(tk.Frame):
                                          if os.path.isfile(os.path.join(seq_path, f))])
             except OSError as e:
                 status = "Issue (Read Error)"
-                results.append((subdir_name, status))
+                results.append((subdir_name, status, seq_path))
                 problem_sequences.append(subdir_name + " (Read Error: " + str(e) + ")")
                 continue
 
@@ -680,7 +737,7 @@ class SequenceCheckerApp(tk.Frame):
                 issue_type = "File Count (" + str(folder_file_count) + " vs " + str(expected_count) + ")"
 
             status = "OK" if sequence_ok else "Issue (" + issue_type + ")"
-            results.append((subdir_name, status))
+            results.append((subdir_name, status, seq_path))
             if not sequence_ok:
                 problem_sequences.append(subdir_name + " (" + issue_type + ")")
 
@@ -729,14 +786,30 @@ class SequenceCheckerApp(tk.Frame):
             for r_idx in range(rows_per_column):
                 index = col_idx * rows_per_column + r_idx
                 if index < n:
-                    folder, status_text = results[index]
+                    folder, status_text, seq_path = results[index]
                     status_bg_color = "lightgreen" if "OK" in status_text else "salmon"
                     if "Read Error" in status_text: status_bg_color = "lightcoral"
 
-                    label_folder = tk.Label(col_frame, text=folder, width=25, anchor="w", relief="groove", borderwidth=1, padx=2, bg=self.BLUE_AURA_BG)
-                    label_folder.grid(row=r_idx + 1, column=0, padx=1, pady=1, sticky="ew")
-                    label_status = tk.Label(col_frame, text=status_text, width=20, anchor="w", bg=status_bg_color, relief="groove", borderwidth=1, padx=2)
-                    label_status.grid(row=r_idx + 1, column=1, padx=1, pady=1, sticky="ew")
+                    folder_btn = tk.Button(
+                        col_frame, text=folder, width=25, anchor="w",
+                        relief="groove", borderwidth=1, padx=2, bg=self.BLUE_AURA_BG,
+                        activebackground=self.BLUE_AURA_BUTTON, cursor="hand2",
+                        highlightthickness=0,
+                        command=lambda p=seq_path: self.open_folder_files_in_firefox(p)
+                    )
+                    folder_btn.bind(
+                        "<Button-3>",
+                        lambda e, p=seq_path: self.show_folder_context_menu(e, p)
+                    )
+                    folder_btn.grid(row=r_idx + 1, column=0, padx=1, pady=1, sticky="nsew")
+                    label_status = tk.Button(
+                        col_frame, text=status_text, width=20, anchor="w",
+                        bg=status_bg_color, activebackground=status_bg_color,
+                        relief="groove", borderwidth=1, padx=2,
+                        state=tk.DISABLED, disabledforeground="black",
+                        highlightthickness=0
+                    )
+                    label_status.grid(row=r_idx + 1, column=1, padx=1, pady=1, sticky="nsew")
 
         self.results_frame.update_idletasks()
         self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
