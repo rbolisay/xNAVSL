@@ -56,13 +56,20 @@ equip_turn_params_config = [
     {'name': 'outer_speed',   'label': 'Outer Equipment WSP:', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
     {'name': 'inner_speed',   'label': 'Inner Equipment WSP:', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
 ]
-# Calculator 5: BSP Converter
+# Calculator 5: Feather Xline (equipment tail crossline from feather angle)
+feather_xline_params_config = [
+    {'name': 'equip_tail_width', 'label': 'Equipment Tail Width (m):', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
+    {'name': 'equip_length',     'label': 'Equipment Length (m):',     'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
+    {'name': 'feather_angle',    'label': 'Feather Angle (deg):',      'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
+    {'name': 'equip_tail_xline', 'label': 'Equipment Tail Xline (m):', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
+]
+# Calculator 6: BSP Converter
 bsp_conv_params_config = [
     {'name': 'bsp_knots_conv', 'label': 'BSP (knots):', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
     {'name': 'bsp_ms_conv',    'label': 'BSP (m/s):',   'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
     {'name': 'bsp_kmh_conv',   'label': 'BSP (km/hr):', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
 ]
-# Calculator 6: Distance Converter
+# Calculator 7: Distance Converter
 dist_conv_params_config = [
     {'name': 'dist_m',  'label': 'Distance (m):',  'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
     {'name': 'dist_nm', 'label': 'Distance (NM):', 'chk_var': None, 'in_var': None, 'chk_widget': None, 'entry_widget': None},
@@ -92,6 +99,9 @@ def update_checkbox_states(calculator_type):
         required_selections = 2
     elif calculator_type == 'equip_turn':
         params_list = equip_turn_params_config
+        required_selections = 3
+    elif calculator_type == 'feather_xline':
+        params_list = feather_xline_params_config
         required_selections = 3
     elif calculator_type == 'bsp_conv':
         params_list = bsp_conv_params_config
@@ -546,6 +556,152 @@ def calculate_equip_turn():
         else:
             output_var.set("")
 
+# --- Feather Xline helpers ---
+def _feather_half_width_offset(tail_width, feather_angle_deg):
+    """Half tail width applied in the feather direction (starboard +, port -)."""
+    if abs(feather_angle_deg) < TOLERANCE:
+        return 0.0
+    return math.copysign(tail_width / 2.0, feather_angle_deg)
+
+
+def _feather_tail_xline(length, feather_angle_deg, tail_width):
+    """Total crossline drift of streamer tail (axis opposite + half width)."""
+    opposite = length * math.sin(feather_angle_deg * RADS_PER_DEG)
+    return opposite + _feather_half_width_offset(tail_width, feather_angle_deg)
+
+
+def calculate_feather_xline():
+    """
+    Streamer tail crossline drift from feathering.
+    sin(feather) = Opposite / equip_length (trig opposite along tow axis at tail).
+    Equipment Tail Xline = Opposite + half tail width (starboard +, port -).
+    """
+    checked_items = []
+    unchecked_item = None
+    for param in feather_xline_params_config:
+        if param['chk_var'].get() == 1:
+            checked_items.append(param)
+        else:
+            unchecked_item = param
+
+    if len(checked_items) != 3 or unchecked_item is None:
+        tkMessageBox.showwarning(
+            "Selection Error",
+            "Feather Xline Calc: Please select exactly three parameters as input.",
+        )
+        return
+
+    provided_values = {}
+    try:
+        for param in checked_items:
+            name = param['name']
+            val_str = param['in_var'].get()
+            if not val_str:
+                tkMessageBox.showerror(
+                    "Input Error",
+                    "Feather Xline Calc: Selected input field '{}' is empty.".format(param['label']),
+                )
+                if unchecked_item:
+                    unchecked_item['in_var'].set("")
+                return
+            val_float = float(val_str)
+            if name in ('equip_tail_width', 'equip_length') and val_float < 0:
+                tkMessageBox.showerror(
+                    "Input Error",
+                    "Feather Xline Calc: Input value for '{}' cannot be negative.".format(param['label']),
+                )
+                if unchecked_item:
+                    unchecked_item['in_var'].set("")
+                return
+            provided_values[name] = val_float
+    except ValueError:
+        tkMessageBox.showerror(
+            "Input Error",
+            "Feather Xline Calc: Invalid numeric value in one of the selected fields.",
+        )
+        if unchecked_item:
+            unchecked_item['in_var'].set("")
+        return
+    except Exception as e:
+        tkMessageBox.showerror("Error", "Feather Xline Calc: Error reading inputs: {}".format(e))
+        if unchecked_item:
+            unchecked_item['in_var'].set("")
+        return
+
+    target_name = unchecked_item['name']
+    calculated_value = None
+    try:
+        W = provided_values.get('equip_tail_width')
+        L = provided_values.get('equip_length')
+        theta_deg = provided_values.get('feather_angle')
+        xline = provided_values.get('equip_tail_xline')
+
+        if target_name == 'equip_tail_xline':
+            if L is None or theta_deg is None or W is None:
+                raise ValueError("Missing input for tail xline calc.")
+            calculated_value = _feather_tail_xline(L, theta_deg, W)
+        elif target_name == 'equip_length':
+            if xline is None or theta_deg is None or W is None:
+                raise ValueError("Missing input for equipment length calc.")
+            sin_theta = math.sin(theta_deg * RADS_PER_DEG)
+            if abs(sin_theta) < TOLERANCE:
+                calculated_value = "Error: sin(angle)=0"
+            else:
+                half_off = _feather_half_width_offset(W, theta_deg)
+                calculated_value = (xline - half_off) / sin_theta
+        elif target_name == 'feather_angle':
+            if xline is None or L is None or W is None:
+                raise ValueError("Missing input for feather angle calc.")
+            if abs(L) < TOLERANCE:
+                calculated_value = "Error: Length=0"
+            else:
+                if xline >= 0:
+                    ratio = (xline - (W / 2.0)) / L
+                else:
+                    ratio = (xline + (W / 2.0)) / L
+                if ratio < -1.0 - TOLERANCE or ratio > 1.0 + TOLERANCE:
+                    calculated_value = "Error: |opposite|>L"
+                else:
+                    ratio = max(-1.0, min(1.0, ratio))
+                    calculated_value = math.asin(ratio) * DEG_PER_RADS
+        elif target_name == 'equip_tail_width':
+            if xline is None or L is None or theta_deg is None:
+                raise ValueError("Missing input for tail width calc.")
+            opposite = L * math.sin(theta_deg * RADS_PER_DEG)
+            half_off = xline - opposite
+            calculated_value = 2.0 * abs(half_off)
+            if abs(theta_deg) >= TOLERANCE and abs(half_off) > TOLERANCE:
+                same_sign = (half_off > 0) == (theta_deg > 0)
+                if not same_sign:
+                    calculated_value = "Error: Inconsistent inputs"
+            elif calculated_value < -TOLERANCE:
+                calculated_value = "Error: Inconsistent inputs"
+            elif calculated_value < 0:
+                calculated_value = 0.0
+        else:
+            calculated_value = "Error: Logic"
+    except ZeroDivisionError:
+        calculated_value = "Error: Div by 0"
+        tkMessageBox.showerror("Math Error", "Feather Xline Calc: Division by zero occurred.")
+    except ValueError as e:
+        calculated_value = "Error: Input"
+        tkMessageBox.showerror("Error", "Feather Xline Calc: {}".format(e))
+    except Exception as e:
+        calculated_value = "Error: Calc"
+        tkMessageBox.showerror("Calculation Error", "Feather Xline Calc: An error occurred: {}".format(e))
+
+    output_var = unchecked_item['in_var']
+    display_value = ""
+    if calculated_value is not None:
+        if isinstance(calculated_value, (int, float)):
+            if abs(calculated_value) < TOLERANCE:
+                display_value = ""
+            else:
+                display_value = "{:.3f}".format(calculated_value)
+        elif isinstance(calculated_value, str):
+            display_value = calculated_value
+    output_var.set(display_value)
+
 def calculate_bsp_conv():
     checked_item = None
     unchecked_items = []
@@ -709,7 +865,7 @@ def create_calculator_frame(parent, config_list, calc_type, title, instructions,
         current_row += 1
 
     # Calculate Button
-    tk.Button(frame, text=button_text, command=command, bg=BUTTON_BG_COLOR, fg=BUTTON_FG, activebackground=BUTTON_BG_COLOR).grid(row=current_row, column=1, columnspan=2, pady=(15, 0), sticky=tk.E)
+    tk.Button(frame, text=button_text, command=command, bg=BUTTON_BG_COLOR, fg=BUTTON_FG, activebackground=BUTTON_BG_COLOR).grid(row=current_row, column=0, columnspan=3, pady=(15, 0), sticky=tk.W, padx=5)
 
     # Configure grid weights
     frame.grid_columnconfigure(1, weight=0)
@@ -790,6 +946,15 @@ class SeisCalPanel(tk.Frame):
         )
         create_calculator_frame(
             self.scrollable_frame,
+            feather_xline_params_config,
+            "feather_xline",
+            "Feather Xline Calculator",
+            "Tick exactly 3 boxes, enter values, then click Calculate",
+            "Calculate Feather Xline",
+            calculate_feather_xline,
+        )
+        create_calculator_frame(
+            self.scrollable_frame,
             bsp_conv_params_config,
             "bsp_conv",
             "BSP Converter",
@@ -811,6 +976,7 @@ class SeisCalPanel(tk.Frame):
         update_checkbox_states("feather")
         update_checkbox_states("turn")
         update_checkbox_states("equip_turn")
+        update_checkbox_states("feather_xline")
         update_checkbox_states("bsp_conv")
         update_checkbox_states("dist_conv")
 

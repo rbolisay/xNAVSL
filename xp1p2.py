@@ -29,6 +29,7 @@ default_FESB_DIR = "/usr/local/trinop/dbase/links/fes_backup"
 default_OUTPUT_CSV = "/usr/local/trinop/qcfiles/Misc/xp1p2.csv"
 DEFAULT_DATA_DIR = "/usr/local/trinop/dbase/links/qcfiles/Misc/xp1p2"
 SESSION_FILE = os.path.join(DEFAULT_DATA_DIR, "session.json")
+CONFIG_EXT = ".xcfg"
 CONFIG_VERSION = 1
 CACHE_VERSION = 1
 
@@ -53,35 +54,94 @@ def safe_config_basename(name):
     """Returns a filesystem-safe configuration basename."""
     raw = (name or "").strip() or "default"
     safe = re.sub(r'[/\\:*?"<>|]+', "_", raw).strip("._ ") or "default"
-    if safe.lower().endswith(".json"):
-        safe = safe[:-5].strip("._ ") or "default"
+    for ext in (".json", CONFIG_EXT):
+        if safe.lower().endswith(ext):
+            safe = safe[: -len(ext)].strip("._ ") or "default"
     return safe[:120]
 
 def config_path_for_name(name, save_dir=None):
-    """Builds the JSON config path for a configuration name."""
+    """Builds the config path for a configuration name."""
     directory = save_dir or DEFAULT_DATA_DIR
-    return os.path.join(directory, safe_config_basename(name) + ".json")
+    return os.path.join(directory, safe_config_basename(name) + CONFIG_EXT)
+
+def is_config_file_path(path):
+    """True when path is a loadable configuration file (not cache/session)."""
+    base = os.path.basename(path).lower()
+    if base == "session.json":
+        return False
+    if base.endswith("_qc_cache.json"):
+        return False
+    return base.endswith(CONFIG_EXT) or base.endswith(".json")
 
 def cache_path_for_name(name):
     """Builds the QC cache JSON path for a configuration name."""
     ensure_data_dir()
     return os.path.join(DEFAULT_DATA_DIR, safe_config_basename(name) + "_qc_cache.json")
 
-def directory_fingerprint(directory):
-    """Lightweight fingerprint for a directory listing."""
+def expected_line_subline_pairs(line_p111, sub_p111, line_p211, sub_p211):
+    """Collects unique (line name, subline) pairs from parsed P111/P211 values."""
+    invalid = {"Missing!", "Multiple Files!"}
+    pairs = []
+    seen = set()
+    for line_name, subline in ((line_p111, sub_p111), (line_p211, sub_p211)):
+        if line_name in invalid or subline in invalid:
+            continue
+        key = (line_name.lower(), subline.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append({"line": line_name, "subline": subline})
+    return pairs
+
+def get_backup_match_signature(backup_dir, expected_pairs):
+    """Signature of backup files matching expected line.subline pairs (name + mtime + size)."""
+    if not expected_pairs:
+        return {"status": "no_pairs"}
+    matches = []
     try:
-        entries = []
-        for filename in os.listdir(directory):
-            path = os.path.join(directory, filename)
-            if os.path.isfile(path):
-                stat = os.stat(path)
-                entries.append((filename, stat.st_mtime, stat.st_size))
-        entries.sort()
-        if not entries:
-            return "empty"
-        return "count={};max_mtime={}".format(len(entries), max(entry[1] for entry in entries))
+        for filename in os.listdir(backup_dir):
+            path = os.path.join(backup_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            for pair in expected_pairs:
+                if backup_filename_matches_line_subline(filename, pair["line"], pair["subline"]):
+                    stat = os.stat(path)
+                    matches.append({
+                        "name": filename,
+                        "mtime": stat.st_mtime,
+                        "size": stat.st_size,
+                    })
+                    break
     except Exception:
-        return "error"
+        return {"status": "error"}
+    matches.sort(key=lambda item: item["name"])
+    if not matches:
+        return {"status": "none"}
+    return {"status": "matched", "files": matches}
+
+def get_fesb_match_signature(fesb_dir, sequence):
+    """Signature of FESB file(s) matching rt_XXXX (name + mtime + size)."""
+    token = "rt_{:04d}".format(sequence).lower()
+    matches = []
+    try:
+        for filename in os.listdir(fesb_dir):
+            path = os.path.join(fesb_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            normalized = strip_compression_extension(filename).lower()
+            if token in filename.lower() or token in normalized:
+                stat = os.stat(path)
+                matches.append({
+                    "name": filename,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                })
+    except Exception:
+        return {"status": "error"}
+    matches.sort(key=lambda item: item["name"])
+    if not matches:
+        return {"status": "none"}
+    return {"status": "matched", "files": matches}
 
 def get_sequence_file_signature(directory, extension, seq_num, file_value):
     """Builds a cache signature for one sequence file selection."""
@@ -110,28 +170,16 @@ def get_sequence_file_signature(directory, extension, seq_num, file_value):
     except Exception:
         return {"status": "missing"}
 
-def build_sequence_inputs(p111_sig, p211_sig, sub_p111, sub_p211, backup_dir, fesb_dir):
+def build_sequence_inputs(p111_sig, p211_sig, line_p111, sub_p111, line_p211, sub_p211, backup_dir, fesb_dir, seq):
     """Builds the input signature stored with each cached QC row."""
-    expected_sublines = []
-    for subline in (sub_p111, sub_p211):
-        if subline not in ["Missing!", "Multiple Files!"] and subline not in expected_sublines:
-            expected_sublines.append(subline)
+    expected_pairs = expected_line_subline_pairs(line_p111, sub_p111, line_p211, sub_p211)
     return {
         "p111": p111_sig,
         "p211": p211_sig,
-        "backup_dir_fp": directory_fingerprint(backup_dir),
-        "fesb_dir_fp": directory_fingerprint(fesb_dir),
-        "expected_sublines": expected_sublines,
+        "expected_line_subline_pairs": expected_pairs,
+        "backup_match": get_backup_match_signature(backup_dir, expected_pairs),
+        "fesb_match": get_fesb_match_signature(fesb_dir, seq),
     }
-
-def sequence_inputs_unchanged(cached_inputs, current_inputs):
-    """Returns True when cached inputs still match the current filesystem state."""
-    if not isinstance(cached_inputs, dict) or not isinstance(current_inputs, dict):
-        return False
-    for key in ("p111", "p211", "backup_dir_fp", "fesb_dir_fp"):
-        if cached_inputs.get(key) != current_inputs.get(key):
-            return False
-    return True
 
 def run_config_browse_dialog(parent):
     """Load file vs save-folder choice."""
@@ -204,11 +252,23 @@ class QCCache(object):
             self.data["paths"] = current_paths
             self.data["sequences"] = {}
 
-    def get_cached_row(self, seq_key, current_inputs):
+    def get_cached_row(self, seq_key, p111_sig, p211_sig, backup_dir, fesb_dir, seq):
         entry = self.data.get("sequences", {}).get(seq_key)
         if not entry:
             return None
-        if not sequence_inputs_unchanged(entry.get("inputs"), current_inputs):
+        cached = entry.get("inputs")
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("p111") != p111_sig or cached.get("p211") != p211_sig:
+            return None
+        expected_pairs = cached.get("expected_line_subline_pairs")
+        if not expected_pairs:
+            return None
+        current_backup = get_backup_match_signature(backup_dir, expected_pairs)
+        current_fesb = get_fesb_match_signature(fesb_dir, seq)
+        if cached.get("backup_match") != current_backup:
+            return None
+        if cached.get("fesb_match") != current_fesb:
             return None
         return entry.get("result_row")
 
@@ -312,30 +372,33 @@ def directory_contains_token(directory, token):
         print("Error accessing {}: {}".format(directory, e))
     return False
 
-def extract_backup_subline(filename):
-    """Extracts the quoted backup subline from the filename when present."""
-    normalized_name = strip_compression_extension(filename)
-    match = re.search(r'"([^"]+)"', normalized_name)
-    if match:
-        return match.group(1).lower()
-    return None
+def parse_backup_line_subline(filename):
+    """Parse line name and subline from line.subline.suffix.BACKUP[.gz|.bz2]."""
+    normalized = strip_compression_extension(filename)
+    if normalized.upper().endswith(".BACKUP"):
+        normalized = normalized[:-len(".BACKUP")]
+    parts = normalized.split(".")
+    if len(parts) < 2:
+        return None, None
+    return parts[0], parts[1]
 
-def backup_filename_matches_subline(filename, subline):
-    """Checks whether a backup filename matches the expected subline."""
-    normalized_name = strip_compression_extension(filename)
-    extracted_subline = extract_backup_subline(normalized_name)
-    if extracted_subline is not None:
-        return extracted_subline == subline.lower()
-    lowered_name = normalized_name.lower()
-    return '"{}"'.format(subline.lower()) in lowered_name or subline.lower() in lowered_name
+def backup_filename_matches_line_subline(filename, line_name, subline):
+    """True when backup name field 1 = line name and field 2 = subline."""
+    invalid = {"Missing!", "Multiple Files!"}
+    if line_name in invalid or subline in invalid:
+        return False
+    parsed_line, parsed_subline = parse_backup_line_subline(filename)
+    if parsed_line is None or parsed_subline is None:
+        return False
+    return (
+        parsed_line.lower() == line_name.lower()
+        and parsed_subline.lower() == subline.lower()
+    )
 
-def check_backup_exists(p111_subline, p211_subline, backup_dir):
-    """Checks whether any backup filename matches the P111/P211 subline."""
-    expected_sublines = []
-    for subline in (p111_subline, p211_subline):
-        if subline not in ["Missing!", "Multiple Files!"] and subline not in expected_sublines:
-            expected_sublines.append(subline)
-    if not expected_sublines:
+def check_backup_exists(line_p111, sub_p111, line_p211, sub_p211, backup_dir):
+    """Checks whether any backup filename matches P111/P211 line name and subline."""
+    expected_pairs = expected_line_subline_pairs(line_p111, sub_p111, line_p211, sub_p211)
+    if not expected_pairs:
         return "Missing Backup!"
     try:
         backup_files = os.listdir(backup_dir)
@@ -345,8 +408,8 @@ def check_backup_exists(p111_subline, p211_subline, backup_dir):
     if not backup_files:
         return "Missing Backup!"
     for filename in backup_files:
-        for subline in expected_sublines:
-            if backup_filename_matches_subline(filename, subline):
+        for pair in expected_pairs:
+            if backup_filename_matches_line_subline(filename, pair["line"], pair["subline"]):
                 return "Backup GOOD"
     return "Backup subline BAD"
 
@@ -412,10 +475,9 @@ class QCWorker(threading.Thread):
             p211_file = p211_files.get(seq, "Missing!")
             p111_sig = get_sequence_file_signature(self.p111_dir, ".p111", seq, p111_file)
             p211_sig = get_sequence_file_signature(self.p211_dir, ".p211", seq, p211_file)
-            partial_inputs = build_sequence_inputs(
-                p111_sig, p211_sig, "Missing!", "Missing!", self.backup_dir, self.fesb_dir
+            cached_row = qc_cache.get_cached_row(
+                seq_key, p111_sig, p211_sig, self.backup_dir, self.fesb_dir, seq
             )
-            cached_row = qc_cache.get_cached_row(seq_key, partial_inputs)
             if cached_row is not None:
                 result_line = cached_row
                 reused_count += 1
@@ -424,7 +486,9 @@ class QCWorker(threading.Thread):
                     extract_shotpoints(p111_file, "S1", 4)
                 fsp_p211_disp, lsp_p211_disp, fsp_p211_num, lsp_p211_num, line_p211, sub_p211 = \
                     extract_shotpoints(p211_file, "E2", 6)
-                backup_xcheck = check_backup_exists(sub_p111, sub_p211, self.backup_dir)
+                backup_xcheck = check_backup_exists(
+                    line_p111, sub_p111, line_p211, sub_p211, self.backup_dir
+                )
                 fesb_xcheck = check_fesb_exists(seq, self.fesb_dir)
                 subline_xcheck = check_subline_xcheck(sub_p111, sub_p211)
                 try:
@@ -452,7 +516,8 @@ class QCWorker(threading.Thread):
                     fesb_xcheck
                 ]
                 inputs = build_sequence_inputs(
-                    p111_sig, p211_sig, sub_p111, sub_p211, self.backup_dir, self.fesb_dir
+                    p111_sig, p211_sig, line_p111, sub_p111, line_p211, sub_p211,
+                    self.backup_dir, self.fesb_dir, seq
                 )
                 qc_cache.put_row(seq_key, inputs, result_line)
                 recomputed_count += 1
@@ -666,8 +731,12 @@ class QCAppPanel(tk.Frame):
         return cache_path_for_name(self.config_name.get())
 
     def load_config_file(self, path):
-        """Loads a configuration JSON file."""
+        """Loads a configuration file (.xcfg or legacy .json)."""
         path = os.path.abspath(path)
+        if not is_config_file_path(path):
+            raise ValueError(
+                "Not a configuration file: {}. Use a .xcfg file (not cache or session).".format(path)
+            )
         f = open(path, "r")
         data = json.load(f)
         f.close()
@@ -748,10 +817,20 @@ class QCAppPanel(tk.Frame):
                 parent=self.winfo_toplevel(),
                 title="Load configuration",
                 initialdir=initialdir,
-                filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
+                filetypes=[
+                    ("xP1P2 config", "*.xcfg"),
+                    ("Legacy JSON config", "*.json"),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 try:
+                    if not is_config_file_path(path):
+                        tkMessageBox.showerror(
+                            "Load error",
+                            "Not a configuration file:\n{}\n\nChoose a .xcfg file.".format(path),
+                        )
+                        return
                     self.load_config_file(path)
                     tkMessageBox.showinfo("Loaded", "Configuration loaded:\n{}".format(path))
                 except Exception as ex:
@@ -769,7 +848,7 @@ class QCAppPanel(tk.Frame):
                 tkMessageBox.showinfo("Save folder", "Configurations will save to:\n{}".format(self.default_save_dir))
 
     def save_config(self):
-        """Saves the current configuration to JSON."""
+        """Saves the current configuration to a .xcfg file."""
         name = safe_config_basename(self.config_name.get())
         self.config_name.set(name)
         if not os.path.isdir(self.default_save_dir):

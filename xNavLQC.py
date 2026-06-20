@@ -584,11 +584,59 @@ class SequenceCheckerApp(tk.Frame):
 
     def _path_to_file_uri(self, path):
         abs_path = os.path.abspath(path)
+        if isinstance(abs_path, unicode):
+            abs_path = abs_path.encode("utf-8")
         return "file://" + urllib.pathname2url(abs_path)
+
+    def _subprocess_env(self):
+        """Child GUI processes need DISPLAY (and PATH) when launched from Tk."""
+        env = os.environ.copy()
+        if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+            env["DISPLAY"] = ":0"
+        return env
+
+    def _find_executable(self, names):
+        """Resolve a binary on Rocky/RHEL when PATH from the IDE is minimal."""
+        if isinstance(names, basestring):
+            names = (names,)
+        path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+        path_dirs.extend(("/usr/bin", "/usr/local/bin", "/bin"))
+        for name in names:
+            for directory in path_dirs:
+                if not directory:
+                    continue
+                full = os.path.join(directory, name)
+                if os.path.isfile(full) and os.access(full, os.X_OK):
+                    return full
+        return None
+
+    def _popen_detached(self, args):
+        """
+        Launch a GUI helper without PIPE on stdout/stderr — piping can block
+        firefox/xdg-open on Linux when buffers fill and nothing reads them.
+        """
+        devnull = open(os.devnull, "w")
+        kwargs = {
+            "stdout": devnull,
+            "stderr": devnull,
+            "env": self._subprocess_env(),
+            "close_fds": True,
+        }
+        if hasattr(os, "setsid"):
+            kwargs["preexec_fn"] = os.setsid
+        return subprocess.Popen(args, **kwargs)
 
     def open_folder_files_in_firefox(self, folder_path):
         if not os.path.isdir(folder_path):
             tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
+            return
+        firefox_bin = self._find_executable(("firefox", "firefox-esr"))
+        if not firefox_bin:
+            tkMessageBox.showerror(
+                "Error",
+                "Firefox not found in PATH.\n"
+                "Install Firefox or ensure /usr/bin/firefox is available."
+            )
             return
         try:
             files = sorted(
@@ -604,11 +652,7 @@ class SequenceCheckerApp(tk.Frame):
             return
         file_uris = [self._path_to_file_uri(f) for f in files]
         try:
-            subprocess.Popen(
-                ["firefox"] + file_uris,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            self._popen_detached([firefox_bin] + file_uris)
         except OSError as e:
             tkMessageBox.showerror("Error", "Could not launch Firefox:\n" + str(e))
 
@@ -616,12 +660,15 @@ class SequenceCheckerApp(tk.Frame):
         if not os.path.isdir(folder_path):
             tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
             return
-        try:
-            subprocess.Popen(
-                ["xdg-open", folder_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+        xdg_bin = self._find_executable(("xdg-open", "nautilus", "nemo", "dolphin"))
+        if not xdg_bin:
+            tkMessageBox.showerror(
+                "Error",
+                "No file manager launcher found (xdg-open, nautilus, etc.)."
             )
+            return
+        try:
+            self._popen_detached([xdg_bin, folder_path])
         except OSError as e:
             tkMessageBox.showerror("Error", "Could not open folder in file manager:\n" + str(e))
 
@@ -629,12 +676,10 @@ class SequenceCheckerApp(tk.Frame):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(
             label="Open in Explorer",
-            command=lambda: self.open_folder_in_explorer(folder_path)
+            command=lambda p=folder_path: self.open_folder_in_explorer(p)
         )
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        menu.post(event.x_root, event.y_root)
+        return "break"
 
     def scan_sequences(self):
         for widget in self.results_frame.winfo_children():
