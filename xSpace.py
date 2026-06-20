@@ -89,6 +89,30 @@ def human_size(num_bytes):
     return "%.2f %s" % (n, units[i])
 
 
+def parse_human_size(size_str):
+    """Parse human size strings from df -h / du -sh (e.g. 1.2G, 500M, 12K)."""
+    if not size_str or size_str.strip() in ("-", "0", "0B"):
+        return 0
+    s = size_str.strip().upper().rstrip("B").strip()
+    units = [
+        ("PI", 1024 ** 5), ("P", 1024 ** 5),
+        ("TI", 1024 ** 4), ("T", 1024 ** 4),
+        ("GI", 1024 ** 3), ("G", 1024 ** 3),
+        ("MI", 1024 ** 2), ("M", 1024 ** 2),
+        ("KI", 1024), ("K", 1024),
+    ]
+    for suffix, mult in units:
+        if s.endswith(suffix):
+            try:
+                return int(float(s[:-len(suffix)].strip()) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
 def tile_color(name, index):
     """Deterministic color from folder name and position."""
     if name.startswith("."):
@@ -169,6 +193,7 @@ def run_remote_command(host, command, user=None, password="", key_file="", force
 
     target = _ssh_target(host, user)
     common = [
+        "-x",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=%d" % SSH_TIMEOUT,
         "-o", "LogLevel=ERROR",
@@ -265,6 +290,38 @@ def parse_du_output(raw, parent_path):
     return entries
 
 
+def parse_du_sh_output(raw, parent_path):
+    """Parse du -sh * output lines into entry dicts."""
+    entries = []
+    parent_path = os.path.normpath(parent_path or "/")
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        size_bytes = parse_human_size(parts[0])
+        name = parts[1].strip()
+        if not name or name in (".", ".."):
+            continue
+        child_path = os.path.normpath(os.path.join(parent_path, name))
+        is_dir = True
+        try:
+            if os.path.lexists(child_path):
+                is_dir = os.path.isdir(child_path)
+        except OSError:
+            is_dir = True
+        entries.append({
+            "name": name,
+            "path": child_path,
+            "size": max(size_bytes, 1),
+            "is_dir": is_dir,
+        })
+    entries.sort(key=lambda e: e["size"], reverse=True)
+    return entries
+
+
 def _du_size_bytes(path):
     """Run du -sk on one path; return size in bytes or 0."""
     try:
@@ -298,53 +355,52 @@ def _du_size_bytes(path):
     return 0
 
 
-def _du_scan_shell_cmd(directory):
-    """One-level find+du scan (NFS-safe, no shell glob)."""
+def _du_sh_shell_cmd(directory):
+    """cd into directory and run du -sh * (one-level folder sizes)."""
     quoted = directory.replace("'", "'\\''")
     return (
-        "timeout %d find '%s' -mindepth 1 -maxdepth 1 "
-        "-exec du -sk {} + 2>/dev/null"
+        "timeout %d sh -c 'cd \\'%s\\' && du -sh * 2>/dev/null'"
         % (SCAN_TIMEOUT, quoted))
 
 
-def _root_overview_shell_cmd():
-    """
-    Root view: /dev/sd* block device sizes + used space on NFS mounts.
-    Matches manual workflow on navoff1/navcon1 (df/du after ssh -X).
-    """
-    return (
-        "timeout %d sh -c '"
-        "for d in /dev/sd*; do "
-        "[ -b \"$d\" ] || continue; "
-        "bytes=$(blockdev --getsize64 \"$d\" 2>/dev/null) || bytes=0; "
-        "kb=$(( bytes / 1024 )); "
-        "[ \"$kb\" -gt 0 ] || kb=1; "
-        "echo \"$kb $d\"; "
-        "done; "
-        "mount | grep nfs | grep -E \" type nfs[4]? \" | awk \"{print \\$3}\" | "
-        "while read -r mpt; do "
-        "[ -n \"$mpt\" ] && du -sk \"$mpt\" 2>/dev/null; "
-        "done'"
-        % SCAN_TIMEOUT
-    )
+def _df_h_shell_cmd():
+    """Root view: df -h on the selected server."""
+    return "timeout %d df -h 2>/dev/null" % SCAN_TIMEOUT
 
 
-def _finalize_root_entries(entries):
-    """Mark disks vs mount points for treemap navigation."""
-    for e in entries:
-        path = e.get("path", "")
-        e["is_dir"] = not path.startswith("/dev/")
-    return entries
+# Skip ephemeral filesystems in df -h root tiles.
+_DF_SKIP_FS_PREFIXES = ("tmpfs", "devtmpfs", "overlay", "squashfs", "efivarfs")
 
 
-def scan_root_overview(host):
-    """Scan / as disks (/dev/sd*) + NFS shares (mount | grep nfs)."""
-    cmd = _root_overview_shell_cmd()
+def scan_df_h_overview(host):
+    """Scan root via df -h; tile size = Used space on each mount."""
+    cmd = _df_h_shell_cmd()
     out, err, rc = run_remote_command(host, cmd, force_ssh=True)
-    if out.strip():
-        entries = parse_du_output(out, "/")
-        if entries:
-            return _finalize_root_entries(entries), ""
+    merged = _merge_df_lines(out)
+    entries = []
+    for line in merged:
+        stats = _parse_df_line(line)
+        if not stats:
+            continue
+        fs = stats.get("filesystem", "")
+        if any(fs.startswith(p) for p in _DF_SKIP_FS_PREFIXES):
+            continue
+        mounted = stats.get("mounted", "")
+        if not mounted:
+            continue
+        used_bytes = parse_human_size(stats.get("used", "0"))
+        if used_bytes <= 0:
+            used_bytes = 1
+        name = os.path.basename(mounted.rstrip("/")) or mounted
+        entries.append({
+            "name": name,
+            "path": mounted,
+            "size": used_bytes,
+            "is_dir": True,
+        })
+    entries.sort(key=lambda e: e["size"], reverse=True)
+    if entries:
+        return entries, ""
     err_msg = (err or "").strip()
     if err_msg:
         if "permission denied" in err_msg.lower() and "publickey" in err_msg.lower():
@@ -352,7 +408,7 @@ def scan_root_overview(host):
                 "%s — try: ssh %s true  (load key: ssh-add -l)"
                 % (err_msg, host))
         return [], err_msg
-    return [], "Root overview empty (check: ssh %s blockdev / mount | grep nfs)" % host
+    return [], "df -h returned no data (check: ssh -x %s 'df -h')" % host
 
 
 def _scan_find_du(directory):
@@ -443,19 +499,35 @@ def scan_local_du(directory, progress_cb=None):
     return scan_local_du_per_child(directory, progress_cb=progress_cb)
 
 
-def scan_remote_du(host, directory):
-    """Scan remote directory via SSH — one fast find+du command."""
+def scan_local_du_sh(directory):
+    """Local cd && du -sh * when already logged into the server."""
+    directory = os.path.normpath(directory or "/")
     quoted = directory.replace("'", "'\\''")
-    for cmd in (
-        _du_scan_shell_cmd(directory),
-        "timeout %d find '%s' -mindepth 1 -maxdepth 1 -exec du -sk {} \\; 2>/dev/null"
-        % (SCAN_TIMEOUT, quoted),
-    ):
-        out, err, rc = run_remote_command(host, cmd, force_ssh=True)
+    cmd = "cd '%s' && du -sh * 2>/dev/null" % quoted
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
         if out.strip():
-            entries = parse_du_output(out, directory)
+            entries = parse_du_sh_output(out, directory)
             if entries:
-                return entries, ""
+                return entries
+    except OSError:
+        pass
+    return []
+
+
+def scan_remote_du(host, directory):
+    """Scan remote directory via SSH — cd && du -sh *."""
+    cmd = _du_sh_shell_cmd(directory)
+    out, err, rc = run_remote_command(host, cmd, force_ssh=True)
+    if out.strip():
+        entries = parse_du_sh_output(out, directory)
+        if entries:
+            return entries, ""
     err_msg = (err or "").strip()
     if err_msg:
         if "permission denied" in err_msg.lower() and "publickey" in err_msg.lower():
@@ -463,8 +535,8 @@ def scan_remote_du(host, directory):
                 "%s — try: ssh %s true  (load key: ssh-add -l)"
                 % (err_msg, host))
         return [], err_msg
-    return [], "Remote scan returned no data (check: ssh %s '%s')" % (
-        host, _du_scan_shell_cmd(directory))
+    return [], "Remote scan returned no data (check: ssh -x %s 'cd %s && du -sh *')" % (
+        host, directory)
 
 
 def _host_for_path(path):
@@ -477,13 +549,33 @@ def _host_for_path(path):
     return None
 
 
+def path_exists_on_server(server_key, path):
+    """True if path is an existing directory on the selected server."""
+    path = os.path.normpath((path or "").strip())
+    if not path:
+        return False
+    cfg = SERVERS.get(server_key, {})
+    host = cfg.get("host", server_key)
+    if is_local_host(host):
+        return _local_path_readable(path)
+    quoted = path.replace("'", "'\\''")
+    _, _, rc = run_remote_command(host, "test -d '%s'" % quoted, force_ssh=True)
+    return rc == 0
+
+
 def scan_directory(server_key, directory, progress_cb=None):
-    """Scan on the selected server (local shell when already ssh'd in, else ssh host)."""
+    """Scan on the selected server: df -h at /, else cd && du -sh *."""
     cfg = SERVERS.get(server_key, {})
     host = cfg.get("host", server_key)
     directory = os.path.normpath((directory or "/").strip())
     if directory == "/":
-        return scan_root_overview(host)
+        return scan_df_h_overview(host)
+    if is_local_host(host):
+        entries = scan_local_du_sh(directory)
+        if entries:
+            return entries, ""
+        entries = scan_local_du(directory, progress_cb=progress_cb)
+        return entries, ""
     return scan_remote_du(host, directory)
 
 
@@ -929,6 +1021,8 @@ class XSpacePanel(tk.Frame):
         self._scan_thread = None
         self._scan_token = 0
         self._nav_stack = []
+        self._go_check_after = None
+        self._go_check_token = 0
 
         self.server_var = tk.StringVar(value="navoff1")
         self.path_var = tk.StringVar(value="")
@@ -983,10 +1077,14 @@ class XSpacePanel(tk.Frame):
             path_row, textvariable=self.path_var, bg=ENTRY_BG, fg=TEXT_FG,
             font=FONT_SMALL)
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        tk.Button(
+        self.go_btn = tk.Button(
             path_row, text="Go", bg=BTN_BG, activebackground=BTN_ACTIVE,
             width=4, command=self._go_path,
-        ).pack(side=tk.LEFT)
+        )
+        self.go_btn.pack(side=tk.LEFT)
+        self.path_var.trace("w", self._schedule_go_button_check)
+        self.server_var.trace("w", self._schedule_go_button_check)
+        self._schedule_go_button_check()
 
         self.canvas = TreemapCanvas(
             self,
@@ -1010,8 +1108,43 @@ class XSpacePanel(tk.Frame):
         ).pack(fill=tk.X)
 
     def _server_root(self):
-        """Default path: disk + NFS overview (not full filesystem root)."""
+        """Root view: df -h filesystem overview."""
         return "/"
+
+    def _schedule_go_button_check(self, *args):
+        if self._go_check_after is not None:
+            try:
+                self.after_cancel(self._go_check_after)
+            except Exception:
+                pass
+        self._go_check_after = self.after(350, self._update_go_button_state)
+
+    def _update_go_button_state(self):
+        self._go_check_after = None
+        path = self.path_var.get().strip()
+        if not path:
+            self.go_btn.config(state=tk.DISABLED, disabledforeground=STATUS_FG)
+            return
+        if path == "/":
+            self.go_btn.config(state=tk.NORMAL)
+            return
+        self._go_check_token += 1
+        token = self._go_check_token
+        server = self.server_var.get()
+
+        def worker():
+            exists = path_exists_on_server(server, path)
+            self.after(0, lambda: self._apply_go_button_state(token, exists))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_go_button_state(self, token, exists):
+        if token != self._go_check_token:
+            return
+        if exists:
+            self.go_btn.config(state=tk.NORMAL)
+        else:
+            self.go_btn.config(state=tk.DISABLED, disabledforeground=STATUS_FG)
 
     def _initial_scan(self):
         root = self._server_root()
@@ -1047,9 +1180,10 @@ class XSpacePanel(tk.Frame):
 
     def _go_path(self):
         path = self.path_var.get().strip()
-        if path:
-            self._nav_stack.append(path)
-            self._start_scan(path)
+        if not path or str(self.go_btn.cget("state")) == tk.DISABLED:
+            return
+        self._nav_stack.append(path)
+        self._start_scan(path)
 
     def _visualize_initial_dir(self):
         """Best starting folder for Visualize Folder dialog."""
@@ -1109,10 +1243,12 @@ class XSpacePanel(tk.Frame):
         self.path_var.set(path)
         if path == "/":
             self.status_var.set(
-                "Scanning disks (/dev/sd*) and NFS mounts on %s ..."
-                % self.server_var.get())
+                "Running df -h on %s (ssh -x %s 'df -h') ..."
+                % (self.server_var.get(), self.server_var.get()))
         else:
-            self.status_var.set("Scanning contents of %s ..." % path)
+            self.status_var.set(
+                "Running du -sh * in %s on %s ..."
+                % (path, self.server_var.get()))
         self.fs_stats_var.set("")
         self.canvas.set_entries([])
 
@@ -1164,7 +1300,6 @@ class XSpacePanel(tk.Frame):
 
     def _show_context_menu(self, event, item):
         menu = tk.Menu(self, tearoff=0, bg=GUI_BG, fg=TEXT_FG)
-        path = item.get("path", "")
 
         menu.add_command(
             label="Rescan",
@@ -1172,10 +1307,6 @@ class XSpacePanel(tk.Frame):
         menu.add_command(
             label="Browse Directory",
             command=lambda: self._browse_item(item))
-        menu.add_separator()
-        menu.add_command(
-            label="Delete",
-            command=lambda: self._delete_item(item))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1185,13 +1316,14 @@ class XSpacePanel(tk.Frame):
         path = item.get("path", "")
         if not path:
             return
-        if os.path.isdir(path):
+        if item.get("is_dir", True):
             self.path_var.set(path)
             self._start_scan(path)
         else:
             parent = os.path.dirname(path)
-            self.path_var.set(parent)
-            self._start_scan(parent)
+            if parent:
+                self.path_var.set(parent)
+                self._start_scan(parent)
 
     def _browse_item(self, item):
         path = item.get("path", "")
@@ -1199,32 +1331,6 @@ class XSpacePanel(tk.Frame):
             FileExplorerPopup.show(
                 self.winfo_toplevel(), path,
                 title="Browse: %s" % os.path.basename(path.rstrip("/\\")))
-
-    def _delete_item(self, item):
-        path = item.get("path", "")
-        name = item.get("name", path)
-        if not path:
-            return
-        if not messagebox.askyesno(
-                "Confirm Delete",
-                "Delete permanently?\n\n%s\n\nThis cannot be undone." % path,
-                parent=self.winfo_toplevel(), icon="warning"):
-            return
-        try:
-            if os.path.isdir(path):
-                import shutil
-                shutil.rmtree(path)
-            elif os.path.isfile(path):
-                os.remove(path)
-            else:
-                messagebox.showerror(
-                    "Delete", "Path not found locally:\n%s" % path,
-                    parent=self.winfo_toplevel())
-                return
-        except Exception as e:
-            messagebox.showerror("Delete Failed", str(e), parent=self.winfo_toplevel())
-            return
-        self._rescan_current()
 
     def _on_destroy(self, event):
         try:
