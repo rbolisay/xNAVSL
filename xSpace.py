@@ -3,6 +3,11 @@
 """
 xSpace Visual Analyzer  -  WinDirStat-style folder treemap for NAVSL servers.
 Python 2.7 + Tkinter. Embeddable in xNAVSL via xnavsl_embed(master).
+
+Every scan uses the same SSH commands on the selected server, regardless of
+which machine xSpace is launched from:
+  ssh -x navoff1 'df -h'
+  ssh -x navoff1 'cd /path && du -sh *'
 Ai assisted code by RBolisay
 """
 from __future__ import print_function, unicode_literals
@@ -20,7 +25,7 @@ import platform
 import Tkinter as tk
 import ttk
 import tkMessageBox as messagebox
-import tkFileDialog
+import tkSimpleDialog
 
 # ---------------------------------------------------------------------------
 # NAVSL Blue Aura theme
@@ -49,13 +54,10 @@ SERVERS = {
     "storage1":  {"mount": "/aw-storage1",  "host": "storage1"},
 }
 
-# Extra mounts Visualize Folder may open (even if not in Server dropdown selection).
-EXTRA_MOUNTS = ("/aw-storage1",)
-
-# Empty = "ssh navoff1" (User/host from ~/.ssh/config). Set to override, e.g. "shearwater".
-SSH_USER = ""
+# SSH login for all NAVSL server commands (ssh -x user@host '...').
+SSH_USER = "trinop"
+SSH_PASSWORD = "operator"
 SSH_TIMEOUT = 20
-SCAN_TIMEOUT = 120  # max seconds for du/find scan
 
 # WinDirStat-inspired tile palette
 TILE_PALETTE = [
@@ -142,20 +144,26 @@ def is_local_host(host):
     return False
 
 
-def sshpass_available():
-    try:
-        p = subprocess.Popen(
-            ["sshpass", "--version"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        p.communicate()
-        return True
-    except OSError:
-        return False
+def _find_sshpass_bin():
+    """Locate sshpass binary (GUI apps often have a minimal PATH)."""
+    seen = set()
+    candidates = ["sshpass"]
+    path_env = os.environ.get("PATH", "")
+    for d in path_env.split(os.pathsep) + ["/usr/bin", "/bin", "/usr/local/bin"]:
+        if d:
+            candidates.append(os.path.join(d, "sshpass"))
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.add(c)
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
 
 
 def _make_askpass_script(password):
     safe = password.replace("\\", "\\\\").replace("'", "'\\''")
-    script = "#!/bin/sh\nprintf '%s' '{}'\n".format(safe)
+    script = "#!/bin/sh\nexec printf '%s' '{}'\n".format(safe)
     fd, path = tempfile.mkstemp(suffix=".sh", prefix="xspace_")
     try:
         os.write(fd, script.encode("utf-8"))
@@ -163,6 +171,18 @@ def _make_askpass_script(password):
         os.close(fd)
     os.chmod(path, stat.S_IRWXU)
     return path
+
+
+def _password_ssh_opts():
+    """Force password auth without an interactive terminal prompt."""
+    return [
+        "-o", "PubkeyAuthentication=no",
+        "-o", "PreferredAuthentications=keyboard-interactive,password",
+        "-o", "PasswordAuthentication=yes",
+        "-o", "BatchMode=no",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-n",
+    ]
 
 
 def _ssh_target(host, user=None):
@@ -174,9 +194,19 @@ def _ssh_target(host, user=None):
     return host
 
 
-def run_remote_command(host, command, user=None, password="", key_file="", force_ssh=False):
-    """Run shell command on remote host via SSH (force_ssh skips local shortcut)."""
-    if is_local_host(host):
+def ssh_command_display(host, command):
+    """Human-readable equivalent of the remote command."""
+    target = _ssh_target(host)
+    return "ssh -x %s '%s'" % (target, command.replace("'", "'\\''"))
+
+
+def run_remote_command(host, command, user=None, password=None, key_file="", force_ssh=False):
+    """Run command on host. Production scans always pass force_ssh=True."""
+    if user is None:
+        user = SSH_USER
+    if password is None:
+        password = SSH_PASSWORD
+    if is_local_host(host) and not force_ssh:
         # Already logged in on this server (ssh -X navoff1); run directly — no self-ssh auth.
         try:
             proc = subprocess.Popen(
@@ -200,94 +230,63 @@ def run_remote_command(host, command, user=None, password="", key_file="", force
     ]
     askpass_path = None
     env = os.environ.copy()
+    devnull = None
     try:
         if key_file and os.path.isfile(key_file):
             cmd = (["ssh"] + common +
                    ["-o", "BatchMode=yes", "-i", key_file,
                     target, command])
-        elif password and sshpass_available():
-            cmd = (["sshpass", "-p", password, "ssh"] + common +
-                   ["-o", "BatchMode=no",
-                    "-o", "NumberOfPasswordPrompts=1",
-                    target, command])
         elif password:
-            askpass_path = _make_askpass_script(password)
-            env["SSH_ASKPASS"] = askpass_path
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            if "DISPLAY" not in env:
-                env["DISPLAY"] = ":0"
-            cmd = (["ssh"] + common +
-                   ["-o", "BatchMode=no",
-                    "-o", "NumberOfPasswordPrompts=1",
-                    target, command])
+            pwd_opts = _password_ssh_opts()
+            sshpass_bin = _find_sshpass_bin()
+            if sshpass_bin:
+                cmd = ([sshpass_bin, "-p", password, "ssh"] + common +
+                       pwd_opts + [target, command])
+            else:
+                askpass_path = _make_askpass_script(password)
+                env["SSH_ASKPASS"] = askpass_path
+                env["SSH_ASKPASS_REQUIRE"] = "force"
+                env["DISPLAY"] = env.get("DISPLAY") or ":0"
+                cmd = (["ssh"] + common + pwd_opts + [target, command])
         else:
-            # Same as interactive "ssh navoff1" — use ssh config + agent keys.
-            # Do NOT set BatchMode=yes (that forces publickey-only and skips agent/config).
             cmd = (["ssh"] + common + [target, command])
 
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env, stdin=subprocess.PIPE)
+        pop_kw = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+        }
+        devnull = open(os.devnull, "r")
+        pop_kw["stdin"] = devnull
+        if hasattr(os, "setsid"):
+            pop_kw["preexec_fn"] = os.setsid
+
+        proc = subprocess.Popen(cmd, **pop_kw)
         out, err = proc.communicate()
         if isinstance(out, bytes):
             out = out.decode("utf-8", errors="replace")
         if isinstance(err, bytes):
             err = err.decode("utf-8", errors="replace")
+        if password and proc.returncode != 0 and not out.strip():
+            if not _find_sshpass_bin():
+                hint = (
+                    "SSH password auth failed (sshpass not found). "
+                    "Install: yum install sshpass")
+                err = (err.strip() + "\n" + hint).strip()
         return out, err, proc.returncode
     except Exception as e:
         return "", str(e), 1
     finally:
+        if devnull is not None:
+            try:
+                devnull.close()
+            except Exception:
+                pass
         if askpass_path and os.path.exists(askpass_path):
             try:
                 os.unlink(askpass_path)
             except Exception:
                 pass
-
-
-def _local_path_readable(directory):
-    """True if directory can be listed (works when isdir lies on NFS/autofs)."""
-    if not directory:
-        return False
-    try:
-        os.listdir(directory)
-        return True
-    except OSError:
-        return os.path.isdir(directory)
-
-
-def parse_du_output(raw, parent_path):
-    """Parse du -sk output lines into entry dicts."""
-    entries = []
-    parent_path = os.path.normpath(parent_path or "")
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(None, 1)
-        if len(parts) < 2:
-            continue
-        try:
-            size_kb = int(parts[0])
-        except ValueError:
-            continue
-        child_path = os.path.normpath(parts[1].strip())
-        if not os.path.isabs(child_path) and parent_path:
-            child_path = os.path.normpath(os.path.join(parent_path, child_path))
-        name = os.path.basename(child_path.rstrip("/"))
-        if not name:
-            name = child_path
-        try:
-            is_dir = os.path.isdir(child_path)
-        except OSError:
-            is_dir = False
-        entries.append({
-            "name": name,
-            "path": child_path,
-            "size": max(size_kb * 1024, 1),
-            "is_dir": is_dir,
-        })
-    entries.sort(key=lambda e: e["size"], reverse=True)
-    return entries
 
 
 def parse_du_sh_output(raw, parent_path):
@@ -306,66 +305,25 @@ def parse_du_sh_output(raw, parent_path):
         if not name or name in (".", ".."):
             continue
         child_path = os.path.normpath(os.path.join(parent_path, name))
-        is_dir = True
-        try:
-            if os.path.lexists(child_path):
-                is_dir = os.path.isdir(child_path)
-        except OSError:
-            is_dir = True
         entries.append({
             "name": name,
             "path": child_path,
             "size": max(size_bytes, 1),
-            "is_dir": is_dir,
+            "is_dir": True,
         })
     entries.sort(key=lambda e: e["size"], reverse=True)
     return entries
 
 
-def _du_size_bytes(path):
-    """Run du -sk on one path; return size in bytes or 0."""
-    try:
-        proc = subprocess.Popen(
-            ["du", "-sk", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", errors="replace")
-        if out.strip():
-            return int(out.split(None, 1)[0]) * 1024
-    except (OSError, ValueError):
-        pass
-    quoted = path.replace("'", "'\\''")
-    try:
-        proc = subprocess.Popen(
-            "du -sk '%s' 2>/dev/null" % quoted,
-            shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", errors="replace")
-        if out.strip():
-            return int(out.split(None, 1)[0]) * 1024
-    except (OSError, ValueError):
-        pass
-    try:
-        if os.path.isfile(path):
-            return os.path.getsize(path)
-    except OSError:
-        pass
-    return 0
-
-
 def _du_sh_shell_cmd(directory):
     """cd into directory and run du -sh * (one-level folder sizes)."""
     quoted = directory.replace("'", "'\\''")
-    return (
-        "timeout %d sh -c 'cd \\'%s\\' && du -sh * 2>/dev/null'"
-        % (SCAN_TIMEOUT, quoted))
+    return "cd '%s' && du -sh *" % quoted
 
 
 def _df_h_shell_cmd():
     """Root view: df -h on the selected server."""
-    return "timeout %d df -h 2>/dev/null" % SCAN_TIMEOUT
+    return "df -h"
 
 
 # Skip ephemeral filesystems in df -h root tiles.
@@ -408,116 +366,7 @@ def scan_df_h_overview(host):
                 "%s — try: ssh %s true  (load key: ssh-add -l)"
                 % (err_msg, host))
         return [], err_msg
-    return [], "df -h returned no data (check: ssh -x %s 'df -h')" % host
-
-
-def _scan_find_du(directory):
-    """NFS-safe batch du via find (no shell glob)."""
-    directory = os.path.normpath(directory or "")
-    for find_args in (
-        ["find", directory, "-mindepth", "1", "-maxdepth", "1",
-         "-exec", "du", "-sk", "{}", "+"],
-        ["find", directory, "-mindepth", "1", "-maxdepth", "1",
-         "-exec", "du", "-sk", "{}", ";"],
-    ):
-        try:
-            proc = subprocess.Popen(
-                find_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", errors="replace")
-            if out.strip():
-                entries = parse_du_output(out, directory)
-                if entries:
-                    return entries
-        except OSError:
-            continue
-    return []
-
-
-def scan_local_du_per_child(directory, progress_cb=None):
-    """
-    One-level scan via listdir + du per child.
-    Always returns a tile per listdir entry (NFS/autofs safe).
-    """
-    entries = []
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return entries
-    names = [n for n in names if n not in (".", "..")]
-    total_names = len(names)
-    for idx, name in enumerate(names):
-        if progress_cb and idx and idx % 5 == 0:
-            progress_cb(idx, total_names)
-        full = os.path.join(directory, name)
-        is_dir = False
-        is_file = False
-        try:
-            st = os.lstat(full)
-            is_dir = stat.S_ISDIR(st.st_mode)
-            is_file = stat.S_ISREG(st.st_mode)
-        except OSError:
-            try:
-                is_dir = os.path.isdir(full)
-                is_file = os.path.isfile(full)
-            except OSError:
-                pass
-        size = _du_size_bytes(full)
-        if size <= 0 and is_file:
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                size = 0
-        if size <= 0:
-            size = 1
-        entries.append({
-            "name": name,
-            "path": full,
-            "size": size,
-            "is_dir": is_dir or not is_file,
-        })
-    entries.sort(key=lambda e: e["size"], reverse=True)
-    return entries
-
-
-def scan_local_du(directory, progress_cb=None):
-    """Scan immediate children; optimized for NFS mounts (/aw-storage1, etc.)."""
-    if not _local_path_readable(directory):
-        return []
-    try:
-        names = [n for n in os.listdir(directory) if n not in (".", "..")]
-    except OSError:
-        return []
-    if not names:
-        return []
-
-    entries = _scan_find_du(directory)
-    if entries:
-        return entries
-
-    return scan_local_du_per_child(directory, progress_cb=progress_cb)
-
-
-def scan_local_du_sh(directory):
-    """Local cd && du -sh * when already logged into the server."""
-    directory = os.path.normpath(directory or "/")
-    quoted = directory.replace("'", "'\\''")
-    cmd = "cd '%s' && du -sh * 2>/dev/null" % quoted
-    try:
-        proc = subprocess.Popen(
-            cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", errors="replace")
-        if out.strip():
-            entries = parse_du_sh_output(out, directory)
-            if entries:
-                return entries
-    except OSError:
-        pass
-    return []
+    return [], "df -h returned no data (check: %s)" % ssh_command_display(host, _df_h_shell_cmd())
 
 
 def scan_remote_du(host, directory):
@@ -535,47 +384,17 @@ def scan_remote_du(host, directory):
                 "%s — try: ssh %s true  (load key: ssh-add -l)"
                 % (err_msg, host))
         return [], err_msg
-    return [], "Remote scan returned no data (check: ssh -x %s 'cd %s && du -sh *')" % (
-        host, directory)
+    return [], "Remote scan returned no data (check: %s)" % (
+        ssh_command_display(host, _du_sh_shell_cmd(directory)))
 
 
-def _host_for_path(path):
-    """Pick SSH host from path prefix when local mount is unavailable."""
-    path = os.path.normpath(path or "")
-    for key, cfg in SERVERS.items():
-        mount = cfg.get("mount", "")
-        if mount and (path == mount or path.startswith(mount + os.sep)):
-            return cfg.get("host", key)
-    return None
-
-
-def path_exists_on_server(server_key, path):
-    """True if path is an existing directory on the selected server."""
-    path = os.path.normpath((path or "").strip())
-    if not path:
-        return False
-    cfg = SERVERS.get(server_key, {})
-    host = cfg.get("host", server_key)
-    if is_local_host(host):
-        return _local_path_readable(path)
-    quoted = path.replace("'", "'\\''")
-    _, _, rc = run_remote_command(host, "test -d '%s'" % quoted, force_ssh=True)
-    return rc == 0
-
-
-def scan_directory(server_key, directory, progress_cb=None):
-    """Scan on the selected server: df -h at /, else cd && du -sh *."""
+def scan_directory(server_key, directory):
+    """Always scan via SSH on the selected server (same on every machine)."""
     cfg = SERVERS.get(server_key, {})
     host = cfg.get("host", server_key)
     directory = os.path.normpath((directory or "/").strip())
     if directory == "/":
         return scan_df_h_overview(host)
-    if is_local_host(host):
-        entries = scan_local_du_sh(directory)
-        if entries:
-            return entries, ""
-        entries = scan_local_du(directory, progress_cb=progress_cb)
-        return entries, ""
     return scan_remote_du(host, directory)
 
 
@@ -589,6 +408,7 @@ def _parse_df_line(line):
         use_pct = float(use_pct_str)
     except ValueError:
         use_pct = 0.0
+    mounted = parts[5] if len(parts) == 6 else " ".join(parts[5:])
     return {
         "filesystem": parts[0],
         "size": parts[1],
@@ -596,7 +416,7 @@ def _parse_df_line(line):
         "avail": parts[3],
         "use_pct": use_pct,
         "remain_pct": max(0.0, 100.0 - use_pct),
-        "mounted": parts[5],
+        "mounted": mounted,
     }
 
 
@@ -634,7 +454,7 @@ def fetch_filesystem_stats(server_key, path):
     path = os.path.normpath((path or "/").strip())
 
     quoted = path.replace("'", "'\\''")
-    cmd = "df -h '%s' 2>/dev/null" % quoted
+    cmd = "df -h '%s'" % quoted
 
     out, err, rc = run_remote_command(host, cmd, force_ssh=True)
 
@@ -1021,8 +841,6 @@ class XSpacePanel(tk.Frame):
         self._scan_thread = None
         self._scan_token = 0
         self._nav_stack = []
-        self._go_check_after = None
-        self._go_check_token = 0
 
         self.server_var = tk.StringVar(value="navoff1")
         self.path_var = tk.StringVar(value="")
@@ -1077,14 +895,10 @@ class XSpacePanel(tk.Frame):
             path_row, textvariable=self.path_var, bg=ENTRY_BG, fg=TEXT_FG,
             font=FONT_SMALL)
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self.go_btn = tk.Button(
+        tk.Button(
             path_row, text="Go", bg=BTN_BG, activebackground=BTN_ACTIVE,
             width=4, command=self._go_path,
-        )
-        self.go_btn.pack(side=tk.LEFT)
-        self.path_var.trace("w", self._schedule_go_button_check)
-        self.server_var.trace("w", self._schedule_go_button_check)
-        self._schedule_go_button_check()
+        ).pack(side=tk.LEFT)
 
         self.canvas = TreemapCanvas(
             self,
@@ -1110,41 +924,6 @@ class XSpacePanel(tk.Frame):
     def _server_root(self):
         """Root view: df -h filesystem overview."""
         return "/"
-
-    def _schedule_go_button_check(self, *args):
-        if self._go_check_after is not None:
-            try:
-                self.after_cancel(self._go_check_after)
-            except Exception:
-                pass
-        self._go_check_after = self.after(350, self._update_go_button_state)
-
-    def _update_go_button_state(self):
-        self._go_check_after = None
-        path = self.path_var.get().strip()
-        if not path:
-            self.go_btn.config(state=tk.DISABLED, disabledforeground=STATUS_FG)
-            return
-        if path == "/":
-            self.go_btn.config(state=tk.NORMAL)
-            return
-        self._go_check_token += 1
-        token = self._go_check_token
-        server = self.server_var.get()
-
-        def worker():
-            exists = path_exists_on_server(server, path)
-            self.after(0, lambda: self._apply_go_button_state(token, exists))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_go_button_state(self, token, exists):
-        if token != self._go_check_token:
-            return
-        if exists:
-            self.go_btn.config(state=tk.NORMAL)
-        else:
-            self.go_btn.config(state=tk.DISABLED, disabledforeground=STATUS_FG)
 
     def _initial_scan(self):
         root = self._server_root()
@@ -1180,43 +959,35 @@ class XSpacePanel(tk.Frame):
 
     def _go_path(self):
         path = self.path_var.get().strip()
-        if not path or str(self.go_btn.cget("state")) == tk.DISABLED:
-            return
-        self._nav_stack.append(path)
-        self._start_scan(path)
+        if path:
+            self._nav_stack.append(path)
+            self._start_scan(path)
 
-    def _visualize_initial_dir(self):
-        """Best starting folder for Visualize Folder dialog."""
+    def _default_server_path(self):
+        """Default directory path for the selected server (server-side)."""
         path = self.path_var.get().strip()
-        if path and path != "/" and os.path.isdir(path):
+        if path and path != "/":
             return path
         key = self.server_var.get()
         cfg = SERVERS.get(key, {})
-        mount = cfg.get("mount", "/aw-%s" % key)
-        if os.path.isdir(mount):
-            return mount
-        for m in EXTRA_MOUNTS:
-            if os.path.isdir(m):
-                return m
-        for cfg in SERVERS.values():
-            m = cfg.get("mount", "")
-            if m and os.path.isdir(m):
-                return m
-        home = os.path.expanduser("~")
-        if os.path.isdir(home):
-            return home
-        return "/"
+        return cfg.get("mount", "/")
 
     def _pick_folder(self):
-        """Browse for a folder; scan its contents and show treemap tiles."""
-        initial = self._visualize_initial_dir()
-        picked = tkFileDialog.askdirectory(
+        """Enter a directory on the selected server to scan with du -sh *."""
+        server = self.server_var.get()
+        cfg = SERVERS.get(server, {})
+        host = cfg.get("host", server)
+        initial = self._default_server_path()
+        picked = tkSimpleDialog.askstring(
+            "Visualize Folder",
+            "Directory on %s to scan (du -sh *):" % server,
+            initialvalue=initial,
             parent=self.winfo_toplevel(),
-            title="Visualize Folder — contents become tiles",
-            initialdir=initial,
         )
         if picked:
-            picked = os.path.normpath(picked)
+            picked = os.path.normpath(picked.strip())
+            if not picked:
+                return
             self.path_var.set(picked)
             self._nav_stack.append(picked)
             self._start_scan(picked)
@@ -1238,37 +1009,33 @@ class XSpacePanel(tk.Frame):
         self._scan_token += 1
         token = self._scan_token
         server = self.server_var.get()
+        cfg = SERVERS.get(server, {})
+        host = cfg.get("host", server)
         path = os.path.normpath((path or self._server_root()).strip())
-        # Keep user-picked NFS paths (e.g. /aw-storage1/...) when browsing locally.
         self.path_var.set(path)
         if path == "/":
             self.status_var.set(
-                "Running df -h on %s (ssh -x %s 'df -h') ..."
-                % (self.server_var.get(), self.server_var.get()))
+                "Running %s ..." % ssh_command_display(host, _df_h_shell_cmd()))
         else:
             self.status_var.set(
-                "Running du -sh * in %s on %s ..."
-                % (path, self.server_var.get()))
+                "Running %s ..."
+                % ssh_command_display(host, _du_sh_shell_cmd(path)))
         self.fs_stats_var.set("")
         self.canvas.set_entries([])
 
-        def _progress(done, total):
-            self.after(0, lambda: self.status_var.set(
-                "Scanning NFS %s ... sizing %d/%d" % (path, done, total)))
-
         def worker():
-            entries, scan_err = scan_directory(server, path, progress_cb=_progress)
+            entries, scan_err = scan_directory(server, path)
             total = sum(e.get("size", 0) for e in entries)
             fs_stats = fetch_filesystem_stats(server, path)
             self.after(0, lambda: self._apply_scan(
-                token, path, entries, total, fs_stats, scan_err))
+                token, path, entries, total, fs_stats, scan_err, host))
 
         t = threading.Thread(target=worker)
         t.daemon = True
         t.start()
         self._scan_thread = t
 
-    def _apply_scan(self, token, path, entries, total, fs_stats, scan_err=""):
+    def _apply_scan(self, token, path, entries, total, fs_stats, scan_err="", host=""):
         if token != self._scan_token:
             return
         self.canvas.delete("scanning")
@@ -1277,21 +1044,14 @@ class XSpacePanel(tk.Frame):
             self.canvas.set_entries([])
             if scan_err:
                 self.status_var.set(scan_err)
-            elif _local_path_readable(path):
-                try:
-                    names = [n for n in os.listdir(path) if n not in (".", "..")]
-                except OSError:
-                    names = None
-                if names:
-                    self.status_var.set(
-                        "Scan found no sizes for %s (%d items visible locally — retry or check permissions)"
-                        % (path, len(names)))
-                else:
-                    self.status_var.set("Folder is empty: %s" % path)
+            elif path == "/":
+                self.status_var.set(
+                    "No df -h data from %s"
+                    % ssh_command_display(host, _df_h_shell_cmd()))
             else:
                 self.status_var.set(
-                    "Cannot read %s — run: ls %s  (check NFS mount is active)"
-                    % (path, path))
+                    "No du output from %s"
+                    % ssh_command_display(host, _du_sh_shell_cmd(path)))
             return
         self.canvas.set_entries(entries)
         self.status_var.set(
