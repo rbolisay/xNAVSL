@@ -167,6 +167,17 @@ def _normalize_geometry_for_wm(geom_str):
     return geom_str
 
 
+def _ensure_navsl_shell_ttk_theme(style):
+    """clam/alt allow custom tab colors; embedded tools often call theme_use('default')."""
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        try:
+            style.theme_use("alt")
+        except tk.TclError:
+            pass
+
+
 def _apply_navsl_shell_notebook_theme(style, btn_font):
     """Apply blue-aura tab colors to NavSL.TNotebook only (not global TNotebook)."""
     try:
@@ -195,9 +206,22 @@ def _apply_navsl_shell_notebook_theme(style, btn_font):
                 ("selected", color_blue_aura_bg),
                 ("active", color_button_active_bg),
             ],
-            foreground=[("selected", color_header_text)],
+            foreground=[
+                ("selected", color_header_text),
+                ("!selected", color_text_dark),
+            ],
         )
     except tk.TclError:
+        pass
+
+
+def _restore_navsl_shell_notebook_theme(btn_font):
+    """Re-select clam/alt then re-apply NavSL shell tab styles after embed theme_use pollution."""
+    try:
+        style = ttk.Style()
+        _ensure_navsl_shell_ttk_theme(style)
+        _apply_navsl_shell_notebook_theme(style, btn_font)
+    except Exception:
         pass
 
 
@@ -1324,6 +1348,15 @@ class NavSLMediator(object):
             self.left_pane = left_pane
         if right_pane is not None:
             self.right_pane = right_pane
+        if notebook is not None:
+            try:
+                notebook.bind("<<NotebookTabChanged>>", self.restore_shell_notebook_theme)
+            except tk.TclError:
+                pass
+
+    def restore_shell_notebook_theme(self, event=None):
+        """Keep shell tab bar Blue Aura after embedded tools call global theme_use()."""
+        _restore_navsl_shell_notebook_theme(self._btn_font)
 
     def toggle_left_pane(self):
         """Hide or show the configuration / slot buttons pane (right = Gui Display only)."""
@@ -2100,10 +2133,7 @@ class NavSLMediator(object):
                     break
         if not ok:
             self._fallback_subprocess_tab(host, primary, slot_path=path)
-        try:
-            _apply_navsl_shell_notebook_theme(ttk.Style(), self._btn_font)
-        except Exception:
-            pass
+        self.restore_shell_notebook_theme()
         try:
             self.root.update_idletasks()
             self.root.update()
@@ -2643,15 +2673,7 @@ def main():
     )
     hide_left_b.pack(side=tk.RIGHT, padx=(0, 6))
 
-    _nb_style = ttk.Style()
-    try:
-        _nb_style.theme_use("clam")
-    except tk.TclError:
-        try:
-            _nb_style.theme_use("alt")
-        except tk.TclError:
-            pass
-    _apply_navsl_shell_notebook_theme(_nb_style, mediator._btn_font)
+    _restore_navsl_shell_notebook_theme(mediator._btn_font)
 
     nb = ttk.Notebook(right, style=_NAVSL_SHELL_NB_STYLE)
     nb.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
