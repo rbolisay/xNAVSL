@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 # xNavSL / xNAVSL — Python 2.7 only (match site_scripts interpreters).
 # Embed order: Tk subclass shim (class App(tk.Tk) + __main__) -> Tk-root redirect (module-level Tk/mainloop) ->
-# recommended app class (x4D/xdbRead) -> xnavsl_embed(master) hook -> embed_overrides.json ->
+# recommended app class (x4D/xdbRead/…) -> xnavsl_embed(master) hook -> embed_overrides.json ->
 # wrappers/ (auto when a slot path is set or config loaded; thin xnavsl_embed + run_path) ->
-# auto: tk.Frame subclass + ctor heuristics.
+# auto: tk.Frame / ttk.Frame subclass + ctor heuristics ->
+# Tier 1 fallbacks: no_arg_tk_redirect (App() + Tk patch), execute_main (__main__ under Tk patch).
 # Otherwise the script runs as subprocess (own window). Overrides file: see EMBED_OVERRIDES_FILE.
 # Separate-window tools use the same interpreter as xNAVSL — most site_scripts are Python 2.7; run xNAVSL
 # with python2.7 so embed + fallback match. Optional: XNAVSL_TOOL_PYTHON=/path/to/python2.7
@@ -396,6 +397,8 @@ def _read_embed_overrides():
     Also: {\"xp1p2.py\": {\"run_path\": \"/full/path/to/embed-capable/xp1p2.py\"}} so the slot can
     still point at site_scripts while xNAVSL loads a different file for embed/subprocess.
     {\"tool.py\": {\"subprocess_only\": true}} — never imp.load_source (import-time mainloop, etc.).
+    Tier 1: {\"xwd.py\": {\"strategy\": \"no_arg_tk_redirect\", \"class\": \"App\"}} or
+    {\"tool.py\": {\"strategy\": \"execute_main\"}} — extra embed attempts after the standard pipeline.
     """
     global _EMBED_OVERRIDES_CACHE
     if _EMBED_OVERRIDES_CACHE is not None:
@@ -519,7 +522,19 @@ _TK_SUBCLASS_SHIM_HINT_BASENAMES = frozenset(
 _EMBED_RECOMMENDED_APP_CLASS = {
     "x4d.py": "X4DApp",
     "xdbread.py": "XdbReadApp",
+    "xfind.py": "XFindApp",
+    "xcopy.py": "XCopyApp",
+    "xsync.py": "XSyncApp",
+    "xsort.py": "XSortXCheckApp",
+    "xdiag.py": "DiagExtractorApp",
+    "xtapeman.py": "TapeManagerApp",
+    "xsourceditherqc.py": "xSourceDitherQCApp",
+    "xnavlqc.py": "SequenceCheckerApp",
+    "xscr.py": "ScreenRecorderApp",
 }
+
+# Tier 1 optional strategies in embed_overrides.json (per basename): no_arg_tk_redirect, execute_main.
+_EMBED_TIER1_STRATEGIES = frozenset(("no_arg_tk_redirect", "execute_main"))
 
 
 def _must_skip_inprocess_embed(script_path):
@@ -661,6 +676,302 @@ def _script_needs_tk_subclass_shim(script_path):
     return _ast_module_class_inherits_tk(tree)
 
 
+def _read_script_source_text(script_path):
+    """Return decoded Python source for AST helpers (Python 2.7)."""
+    try:
+        with open(script_path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+    try:
+        return data.decode("utf-8-sig", "replace")
+    except Exception:
+        try:
+            return data.decode("utf-8", "replace")
+        except Exception:
+            return data.decode("latin-1", "replace")
+
+
+def _parse_script_ast(script_path):
+    text = _read_script_source_text(script_path)
+    if not text:
+        return None
+    try:
+        return ast.parse(text)
+    except SyntaxError:
+        return None
+
+
+def _script_has_name_main_guard(script_path):
+    tree = _parse_script_ast(script_path)
+    if tree is None:
+        return False
+    return _ast_module_has_name_main_guard(tree)
+
+
+def _is_embeddable_frame_subclass(cls):
+    """True for tk.Frame or ttk.Frame subclasses (not the base Frame classes)."""
+    try:
+        if issubclass(cls, tk.Frame) and cls is not tk.Frame:
+            return True
+    except TypeError:
+        pass
+    try:
+        if issubclass(cls, ttk.Frame) and cls is not ttk.Frame:
+            return True
+    except TypeError:
+        pass
+    return False
+
+
+def _embed_strategy_from_spec(override_spec):
+    """Optional Tier 1 strategy from embed_overrides.json."""
+    if not isinstance(override_spec, dict):
+        return None
+    raw = override_spec.get("strategy")
+    if not isinstance(raw, basestring):
+        return None
+    key = raw.strip().lower().replace("-", "_")
+    if key in _EMBED_TIER1_STRATEGIES:
+        return key
+    return None
+
+
+def _tier1_steps_for_script(basename, override_spec):
+    """
+    Tier 1 fallbacks run only after the standard embed pipeline fails.
+    Optional JSON \"strategy\" limits which Tier 1 attempts run for that basename.
+    """
+    forced = _embed_strategy_from_spec(override_spec)
+    if forced == "no_arg_tk_redirect":
+        return ("no_arg_tk_redirect",)
+    if forced == "execute_main":
+        return ("execute_main",)
+    return ("no_arg_tk_redirect", "execute_main")
+
+
+class _EmbedTkPatchContext(object):
+    """
+    Tier 1: temporary Tk/Toplevel/mainloop patches while instantiating or exec'ing a script.
+    Restores Tkinter module attributes in __exit__ (does not affect xNAVSL after the attempt).
+    """
+
+    def __init__(self, embed_host):
+        self.embed_host = embed_host
+        self._tkmod = None
+        self._orig_Tk = None
+        self._orig_Toplevel = None
+        self._patched_widgets = []
+
+    def __enter__(self):
+        import Tkinter as tkmod
+
+        self._tkmod = tkmod
+        host = self.embed_host
+        self._orig_Tk = tkmod.Tk
+        self._orig_Toplevel = tkmod.Toplevel
+
+        def _RedirectTk(*args, **kwargs):
+            return host
+
+        def _PatchedToplevel(master=None, *args, **kwargs):
+            if master is None:
+                master = host
+            return self._orig_Toplevel(master, *args, **kwargs)
+
+        tkmod.Tk = _RedirectTk
+        tkmod.Toplevel = _PatchedToplevel
+
+        for w in (host,):
+            try:
+                _orig_ml = w.mainloop
+
+                def _NoOpMainloop(_self, n=0):
+                    try:
+                        _self.update_idletasks()
+                    except Exception:
+                        pass
+
+                w.mainloop = lambda n=0, _w=w, _fn=_NoOpMainloop: _fn(_w, n)
+                self._patched_widgets.append((w, _orig_ml))
+            except Exception:
+                pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._tkmod is not None:
+            if self._orig_Tk is not None:
+                self._tkmod.Tk = self._orig_Tk
+            if self._orig_Toplevel is not None:
+                self._tkmod.Toplevel = self._orig_Toplevel
+        for w, orig_ml in self._patched_widgets:
+            try:
+                w.mainloop = orig_ml
+            except Exception:
+                pass
+        self._patched_widgets = []
+        return False
+
+
+def _collect_no_arg_app_classes(mod):
+    """Classes with __init__(self) only — e.g. App() then self.root = tk.Tk() (xWD-style)."""
+    modname = getattr(mod, "__name__", "")
+    found = []
+    for name, cls in inspect.getmembers(mod, inspect.isclass):
+        if getattr(cls, "__module__", None) != modname:
+            continue
+        if _is_tk_shell_class(cls):
+            continue
+        try:
+            if issubclass(cls, threading.Thread):
+                continue
+        except TypeError:
+            pass
+        if not _class_cannot_receive_embed_parent(cls):
+            continue
+        found.append((name, cls))
+
+    def sort_key(item):
+        n, _c = item
+        pref = 0 if n.lower().endswith("app") else 1
+        return (pref, n.lower())
+
+    found.sort(key=sort_key)
+    return [c for _, c in found]
+
+
+def _no_arg_app_host_has_ui(host, inst):
+    """True if no-arg App() left widgets on embed host (directly or via .root)."""
+    try:
+        if host.winfo_children():
+            return True
+    except tk.TclError:
+        pass
+    if inst is None:
+        return False
+    for attr in ("root", "master", "window"):
+        w = getattr(inst, attr, None)
+        if w is None:
+            continue
+        try:
+            if isinstance(w, tk.Widget):
+                if w is host:
+                    return bool(host.winfo_children())
+                try:
+                    if w.winfo_children() or w.winfo_manager():
+                        if w is not host:
+                            try:
+                                w.pack(fill=tk.BOTH, expand=True)
+                            except Exception:
+                                pass
+                        return True
+                except tk.TclError:
+                    pass
+        except Exception:
+            pass
+    return False
+
+
+def _try_embed_no_arg_app(mod, host, class_name=None):
+    """
+    Tier 1: App() with no parent arg but self.root = tk.Tk() inside __init__.
+    Redirects Tk() to embed_host for the duration of the constructor call.
+    """
+    classes = []
+    if class_name:
+        cls = getattr(mod, class_name, None)
+        if inspect.isclass(cls):
+            classes = [cls]
+    else:
+        classes = _collect_no_arg_app_classes(mod)
+    for cls in classes:
+        try:
+            with _EmbedTkPatchContext(host):
+                inst = cls()
+        except Exception:
+            continue
+        if _no_arg_app_host_has_ui(host, inst):
+            return True
+    return False
+
+
+def _imp_load_source_module_as_main(script_path, embed_host):
+    """
+    Tier 1: exec script with __name__ == '__main__' under Tk/Toplevel patches.
+    Uses a fresh module key so the normal import path is unchanged.
+    """
+    if _must_skip_inprocess_embed(script_path):
+        return None
+    if embed_host is not None and _script_needs_tk_subclass_shim(script_path):
+        return _load_script_module_with_tk_subclass_shim(script_path, embed_host)
+    if embed_host is not None and _script_needs_tk_root_redirect(script_path):
+        return _load_script_module_with_tk_root_redirect(script_path, embed_host)
+
+    _init_config_paths()
+    abs_path = os.path.abspath(script_path)
+    script_dir = os.path.dirname(abs_path)
+    if script_dir and script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    mod_key = "navsl_main_" + hashlib.md5(abs_path).hexdigest()
+    for stale in (mod_key, "navsl_" + hashlib.md5(abs_path).hexdigest()):
+        if stale in sys.modules:
+            try:
+                del sys.modules[stale]
+            except KeyError:
+                pass
+    try:
+        with open(abs_path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+    try:
+        text = data.decode("utf-8-sig", "replace")
+    except Exception:
+        try:
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            text = data.decode("latin-1", "replace")
+    try:
+        code = compile(text, abs_path, "exec")
+    except SyntaxError:
+        return None
+    mod = imp.new_module(mod_key)
+    mod.__file__ = abs_path
+    mod.__name__ = "__main__"
+    if script_dir:
+        mod.__path__ = [script_dir]
+    if "__builtins__" not in mod.__dict__:
+        mod.__dict__["__builtins__"] = __builtins__
+    try:
+        with _EmbedTkPatchContext(embed_host):
+            exec code in mod.__dict__
+        setattr(mod, "_navsl_ui_built_in_host", True)
+        sys.modules[mod_key] = mod
+        return mod
+    except Exception:
+        return None
+
+
+def _try_embed_execute_main_block(script_path, embed_host):
+    """Tier 1: run if __name__ == '__main__' body under embed patches (last resort)."""
+    if not _script_has_name_main_guard(script_path):
+        return False
+    mod = _imp_load_source_module_as_main(script_path, embed_host)
+    if mod is None:
+        return False
+    if getattr(mod, "_navsl_ui_built_in_host", False):
+        return bool(embed_host.winfo_children())
+    return bool(embed_host.winfo_children())
+
+
+def _format_embed_attempt_log(log_lines):
+    if not log_lines:
+        return u""
+    return u"\n\n--- Embed attempts (Tier 1 included) ---\n" + u"\n".join(
+        u"- %s" % _as_unicode(line) for line in log_lines
+    )
+
+
 # Basenames that often exist both in site_scripts (old) and beside xNAVSL (embed-capable copy).
 _EMBED_SIBLING_NAMES = frozenset(
     (
@@ -728,6 +1039,11 @@ def _class_cannot_receive_embed_parent(cls):
     except TypeError:
         pass
     try:
+        if issubclass(cls, ttk.Frame) and cls is not ttk.Frame:
+            return False
+    except TypeError:
+        pass
+    try:
         spec = inspect.getargspec(cls.__init__)
         args, varargs, keywords = spec[0], spec[1], spec[2]
     except (TypeError, AttributeError):
@@ -754,10 +1070,7 @@ def _collect_candidate_classes(mod):
 
     def sort_key(item):
         n, c = item
-        try:
-            is_frame = issubclass(c, tk.Frame) and c is not tk.Frame
-        except TypeError:
-            is_frame = False
+        is_frame = _is_embeddable_frame_subclass(c)
         pref_frame = 0 if is_frame else 1
         pref_app = 0 if n.lower().endswith("app") else 1
         return (pref_frame, pref_app, n.lower())
@@ -976,7 +1289,7 @@ def _module_defines_only_tk_shell_ui(mod):
             has_tk_shell = True
             continue
         try:
-            if issubclass(cls, tk.Frame) and cls is not tk.Frame:
+            if _is_embeddable_frame_subclass(cls):
                 has_frame_subclass = True
                 break
         except TypeError:
@@ -1158,6 +1471,11 @@ def _try_embed_recommended_app_class(mod, host, basename):
     except TypeError:
         try:
             inst = cls(master=host)
+        except TypeError:
+            try:
+                inst = cls(root=host)
+            except Exception:
+                return False
         except Exception:
             return False
     except Exception:
@@ -2142,15 +2460,43 @@ class NavSLMediator(object):
 
     def _try_embed(self, host, script_path, tab_title):
         """Load script in-process: hooks, embed_overrides.json, autodiscover — each must yield visible UI."""
+        embed_log = []
+        host._navsl_embed_log = embed_log
+
+        def _elog(msg):
+            embed_log.append(msg)
+
         _xscr_tok = _xscr_embed_runtime_begin(script_path)
         try:
             basename = os.path.basename(script_path).lower()
+            override_spec = _read_embed_overrides().get(basename)
+            tier1_steps = _tier1_steps_for_script(basename, override_spec)
+
             mod = _load_script_module(script_path, embed_host=host)
             if mod is None:
+                _elog("Standard load: skipped or failed (subprocess_only or import error)")
+                if not _must_skip_inprocess_embed(script_path):
+                    for step_name in tier1_steps:
+                        if step_name == "execute_main":
+                            _elog("Tier 1: execute_main (as __main__ under Tk patch)")
+                            try:
+                                if _try_embed_execute_main_block(script_path, host):
+                                    if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
+                                        host.title(tab_title)
+                                        return True
+                                    if host.winfo_children():
+                                        host.title(tab_title)
+                                        return True
+                            except Exception as ex:
+                                _elog("Tier 1 execute_main failed: %s" % ex)
+                            _clear_host_children(host)
                 return False
+
+            _elog("Standard load: module imported")
 
             # Tk-root redirect: UI was built into host during imp.load_source (no xnavsl_embed).
             if getattr(mod, "_navsl_ui_built_in_host", False):
+                _elog("Built-in host: Tk redirect or Tk subclass shim during load")
                 try:
                     if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
                         host.title(tab_title)
@@ -2164,11 +2510,13 @@ class NavSLMediator(object):
                 except Exception:
                     pass
                 # Do not run hooks/autodiscover here — they would clear the host and cannot re-import the module.
+                _elog("Built-in host: no visible UI after load")
                 return False
 
             # x4D / xdbRead: construct known app class(host) before hooks (autodiscover may try helper Frames first).
             try:
                 if _try_embed_recommended_app_class(mod, host, basename):
+                    _elog("Recommended app class for %s" % basename)
                     if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
                         host.title(tab_title)
                         return True
@@ -2182,41 +2530,84 @@ class NavSLMediator(object):
             except Exception:
                 pass
 
-            override_spec = _read_embed_overrides().get(basename)
             has_class_override = isinstance(override_spec, dict) and (
                 override_spec.get("class") or override_spec.get("entry")
             )
 
             steps = []
             if has_class_override:
-                steps.append(lambda: _try_embed_override(mod, host, override_spec))
+                steps.append(("embed_overrides class", lambda: _try_embed_override(mod, host, override_spec)))
             embed_candidates = None
             if not _module_defines_only_tk_shell_ui(mod):
                 embed_candidates = _collect_candidate_classes(mod)
             if embed_candidates:
                 cands = embed_candidates
-                steps.append(lambda: _try_embed_autodiscover(mod, host, cands))
+                steps.append(("autodiscover", lambda: _try_embed_autodiscover(mod, host, cands)))
 
             # Hooks first: relaxed success if host has children (strict size check can false-negative early).
             try:
                 if _try_embed_hooks(mod, host):
+                    _elog("xnavsl_embed / build_ui hook")
                     if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
                         host.title(tab_title)
                         return True
+                else:
+                    _elog("Hooks: none succeeded")
             except Exception:
-                pass
+                _elog("Hooks: error during attempt")
             _clear_host_children(host)
 
-            for step in steps:
+            for label, step in steps:
                 try:
                     if not step():
+                        _elog("%s: no match" % label)
                         continue
+                    _elog("%s: instantiated" % label)
                     if _finalize_embed_visible(host, self.root, trust_hook_nonempty=False):
                         host.title(tab_title)
                         return True
                 except Exception:
-                    pass
+                    _elog("%s: error" % label)
                 _clear_host_children(host)
+
+            # --- Tier 1 fallbacks (additive; only after standard pipeline fails) ---
+            no_arg_class = None
+            if isinstance(override_spec, dict):
+                raw_c = override_spec.get("class") or override_spec.get("entry")
+                if isinstance(raw_c, basestring) and raw_c.strip():
+                    no_arg_class = raw_c.strip()
+
+            for step_name in tier1_steps:
+                if step_name == "no_arg_tk_redirect":
+                    _elog("Tier 1: no_arg_tk_redirect (App() with Tk() redirect)")
+                    try:
+                        if _try_embed_no_arg_app(mod, host, class_name=no_arg_class):
+                            if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
+                                host.title(tab_title)
+                                return True
+                            if host.winfo_children():
+                                host.title(tab_title)
+                                return True
+                    except Exception as ex:
+                        _elog("Tier 1 no_arg_tk_redirect failed: %s" % ex)
+                    _clear_host_children(host)
+                elif step_name == "execute_main":
+                    if not _script_has_name_main_guard(script_path):
+                        _elog("Tier 1: execute_main skipped (no __main__ guard)")
+                        continue
+                    _elog("Tier 1: execute_main (as __main__ under Tk patch)")
+                    try:
+                        if _try_embed_execute_main_block(script_path, host):
+                            if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
+                                host.title(tab_title)
+                                return True
+                            if host.winfo_children():
+                                host.title(tab_title)
+                                return True
+                    except Exception as ex:
+                        _elog("Tier 1 execute_main failed: %s" % ex)
+                    _clear_host_children(host)
+
             return False
         finally:
             _xscr_embed_runtime_end(_xscr_tok)
@@ -2239,6 +2630,7 @@ class NavSLMediator(object):
                     _as_unicode(_python_for_tool_subprocess()),
                 )
             )
+            msg += _format_embed_attempt_log(getattr(host, "_navsl_embed_log", None) or [])
         else:
             ex_base = os.path.basename(subprocess_path).lower()
             msg = (
@@ -2325,6 +2717,7 @@ class NavSLMediator(object):
                 )
             )
         msg += _standalone_script_note(_as_unicode(os.path.basename(subprocess_path or primary_embed_path or "")))
+        msg += _format_embed_attempt_log(getattr(host, "_navsl_embed_log", None) or [])
         # ScrolledText + Font can fail on some Tk builds; always leave a visible Label as well.
         hdr = tk.Label(
             host,
