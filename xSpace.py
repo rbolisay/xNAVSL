@@ -25,7 +25,6 @@ import platform
 import Tkinter as tk
 import ttk
 import tkMessageBox as messagebox
-import tkSimpleDialog
 
 # ---------------------------------------------------------------------------
 # NAVSL Blue Aura theme
@@ -398,6 +397,43 @@ def scan_directory(server_key, directory):
     return scan_remote_du(host, directory)
 
 
+def remote_list_directory(host, directory):
+    """List one directory level on the selected server via SSH ls -1F."""
+    directory = os.path.normpath(directory or "/")
+    quoted = directory.replace("'", "'\\''")
+    if directory == "/":
+        cmd = "ls -1F /"
+    else:
+        cmd = "ls -1F '%s'" % quoted
+    out, err, rc = run_remote_command(host, cmd, force_ssh=True)
+    entries = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line in (".", ".."):
+            continue
+        if line.endswith("/"):
+            name = line[:-1].rstrip()
+            is_dir = True
+        elif line.endswith("@"):
+            name = line[:-1]
+            is_dir = True
+        elif line.endswith("*"):
+            name = line[:-1]
+            is_dir = False
+        else:
+            name = line
+            is_dir = False
+        if not name:
+            continue
+        if directory == "/":
+            full = "/" + name
+        else:
+            full = os.path.normpath(os.path.join(directory, name))
+        entries.append({"name": name, "path": full, "is_dir": is_dir})
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    return entries, (err or "").strip()
+
+
 def _parse_df_line(line):
     """Parse one df -h data line into a stats dict."""
     parts = line.split()
@@ -670,6 +706,224 @@ class FileExplorerPopup(object):
 
 
 # ---------------------------------------------------------------------------
+# Visualize Folder picker (non-modal, single instance, themed)
+# ---------------------------------------------------------------------------
+class VisualizeFolderPopup(object):
+    _instance = None
+
+    @classmethod
+    def show(cls, master, server_key, host, initial_path, on_select):
+        if cls._instance is not None:
+            try:
+                if cls._instance.win.winfo_exists():
+                    cls._instance.reopen(server_key, host, initial_path, on_select)
+                    cls._instance.win.deiconify()
+                    cls._instance.win.lift()
+                    cls._instance.win.focus_force()
+                    return cls._instance
+            except tk.TclError:
+                cls._instance = None
+        cls._instance = cls(master, server_key, host, initial_path, on_select)
+        return cls._instance
+
+    def __init__(self, master, server_key, host, initial_path, on_select):
+        self.master = master
+        self.server_key = server_key
+        self.host = host
+        self.on_select = on_select
+        self.path = os.path.normpath(initial_path or "/")
+        self._list_token = 0
+
+        self.win = tk.Toplevel(master)
+        self.win.title("Visualize Folder — %s" % server_key)
+        self.win.configure(bg=GUI_BG)
+        self.win.geometry("760x520")
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        hdr = tk.Frame(self.win, bg=GUI_BG)
+        hdr.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(
+            hdr, text="Server:", bg=GUI_BG, fg=TEXT_FG, font=FONT_MAIN,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            hdr, text=server_key, bg=GUI_BG, fg=HEADER_FG, font=FONT_BOLD,
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        tk.Label(
+            hdr, text="Path:", bg=GUI_BG, fg=TEXT_FG, font=FONT_MAIN,
+        ).pack(side=tk.LEFT)
+        self.path_label = tk.Label(
+            hdr, text=self.path, bg=GUI_BG, fg=HEADER_FG,
+            font=FONT_SMALL, anchor="w",
+        )
+        self.path_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        btn_row = tk.Frame(self.win, bg=GUI_BG)
+        btn_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Button(
+            btn_row, text="Up", bg=BTN_BG, activebackground=BTN_ACTIVE,
+            command=self._go_up,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            btn_row, text="Refresh", bg=BTN_BG, activebackground=BTN_ACTIVE,
+            command=self._populate,
+        ).pack(side=tk.LEFT, padx=2)
+
+        tree_frame = tk.Frame(self.win, bg=GUI_BG)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        style = ttk.Style(self.win)
+        try:
+            style.configure(
+                "XSpace.Treeview",
+                background=ENTRY_BG,
+                fieldbackground=ENTRY_BG,
+                foreground=TEXT_FG,
+                font=FONT_SMALL,
+            )
+            style.configure(
+                "XSpace.Treeview.Heading",
+                background=BTN_BG,
+                foreground=HEADER_FG,
+                font=FONT_BOLD,
+            )
+        except tk.TclError:
+            pass
+
+        cols = ("name", "type")
+        self.tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings",
+            selectmode="browse", style="XSpace.Treeview")
+        self.tree.heading("name", text="Name")
+        self.tree.heading("type", text="Type")
+        self.tree.column("name", width=520, stretch=True)
+        self.tree.column("type", width=100, stretch=False)
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind("<Double-1>", self._on_double)
+        self.tree.bind("<Return>", self._on_enter_folder)
+
+        foot = tk.Frame(self.win, bg=GUI_BG)
+        foot.pack(fill=tk.X, padx=8, pady=(4, 8))
+        self.status = tk.Label(
+            foot, text="", bg=GUI_BG, fg=STATUS_FG, font=FONT_SMALL, anchor="w")
+        self.status.pack(fill=tk.X, pady=(0, 6))
+
+        btn_row2 = tk.Frame(foot, bg=GUI_BG)
+        btn_row2.pack(fill=tk.X)
+        tk.Button(
+            btn_row2, text="Visualize This Folder", bg=BTN_BG,
+            activebackground=BTN_ACTIVE, font=FONT_BOLD,
+            command=self._visualize_current,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        tk.Button(
+            btn_row2, text="Cancel", bg=BTN_BG, activebackground=BTN_ACTIVE,
+            command=self._on_close,
+        ).pack(side=tk.RIGHT)
+
+        self._populate()
+
+    def reopen(self, server_key, host, initial_path, on_select):
+        self.server_key = server_key
+        self.host = host
+        self.on_select = on_select
+        self.path = os.path.normpath(initial_path or "/")
+        self.win.title("Visualize Folder — %s" % server_key)
+        self.path_label.config(text=self.path)
+        self._populate()
+
+    def _on_close(self):
+        VisualizeFolderPopup._instance = None
+        self.win.destroy()
+
+    def _go_up(self):
+        if self.path == "/":
+            return
+        parent = os.path.dirname(self.path.rstrip("/"))
+        if not parent:
+            parent = "/"
+        if parent == self.path:
+            return
+        self.path = parent
+        self.path_label.config(text=self.path)
+        self._populate()
+
+    def _populate(self):
+        self._list_token += 1
+        token = self._list_token
+        self.status.config(
+            text="Loading %s ..." % ssh_command_display(
+                self.host, "ls -1F '%s'" % self.path.replace("'", "'\\''")))
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        def worker():
+            entries, err = remote_list_directory(self.host, self.path)
+            self.win.after(0, lambda: self._apply_list(token, entries, err))
+
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+    def _apply_list(self, token, entries, err):
+        if token != self._list_token:
+            return
+        if err and not entries:
+            self.status.config(text="Error: %s" % err)
+            return
+        count = 0
+        for ent in entries:
+            typ = "Folder" if ent.get("is_dir") else "File"
+            self.tree.insert(
+                "", tk.END,
+                values=(ent.get("name", ""), typ),
+                tags=(ent.get("path", ""),),
+            )
+            count += 1
+        self.status.config(
+            text="%d items  |  double-click folder to open  |  %s"
+            % (count, self.path))
+
+    def _selected_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        tags = self.tree.item(sel[0], "tags")
+        if tags:
+            return tags[0]
+        vals = self.tree.item(sel[0], "values")
+        if vals:
+            return os.path.normpath(os.path.join(self.path, vals[0]))
+        return None
+
+    def _on_double(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        vals = self.tree.item(sel[0], "values")
+        if not vals or vals[1] != "Folder":
+            return
+        tags = self.tree.item(sel[0], "tags")
+        if tags:
+            self.path = tags[0]
+        else:
+            self.path = os.path.normpath(os.path.join(self.path, vals[0]))
+        self.path_label.config(text=self.path)
+        self._populate()
+
+    def _on_enter_folder(self, event):
+        self._on_double(event)
+
+    def _visualize_current(self):
+        if callable(self.on_select):
+            self.on_select(self.path)
+        self._on_close()
+
+
+# ---------------------------------------------------------------------------
 # Treemap canvas
 # ---------------------------------------------------------------------------
 class TreemapCanvas(tk.Canvas):
@@ -688,7 +942,7 @@ class TreemapCanvas(tk.Canvas):
         self.bind("<Configure>", self._on_configure)
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._hide_tooltip)
-        self.bind("<Double-Button-1>", self._on_double)
+        self.bind("<Button-1>", self._on_click)
         self.bind("<Button-3>", self._on_right)
         if sys.platform == "darwin":
             self.bind("<Button-2>", self._on_right)
@@ -805,7 +1059,7 @@ class TreemapCanvas(tk.Canvas):
                 pass
             self._tooltip = None
 
-    def _on_double(self, event):
+    def _on_click(self, event):
         t = self._hit_test(event.x, event.y)
         if t is None:
             return
@@ -973,24 +1227,22 @@ class XSpacePanel(tk.Frame):
         return cfg.get("mount", "/")
 
     def _pick_folder(self):
-        """Enter a directory on the selected server to scan with du -sh *."""
+        """Browse directories on the selected server, then visualize with du -sh *."""
         server = self.server_var.get()
         cfg = SERVERS.get(server, {})
         host = cfg.get("host", server)
         initial = self._default_server_path()
-        picked = tkSimpleDialog.askstring(
-            "Visualize Folder",
-            "Directory on %s to scan (du -sh *):" % server,
-            initialvalue=initial,
-            parent=self.winfo_toplevel(),
-        )
-        if picked:
-            picked = os.path.normpath(picked.strip())
-            if not picked:
+
+        def on_select(path):
+            path = os.path.normpath(path.strip())
+            if not path:
                 return
-            self.path_var.set(picked)
-            self._nav_stack.append(picked)
-            self._start_scan(picked)
+            self.path_var.set(path)
+            self._nav_stack.append(path)
+            self._start_scan(path)
+
+        VisualizeFolderPopup.show(
+            self.winfo_toplevel(), server, host, initial, on_select)
 
     def _rescan_current(self):
         path = self.path_var.get().strip()
