@@ -1458,27 +1458,69 @@ def _load_script_module_with_tk_subclass_shim(script_path, embed_host):
         tkmod.Tk = _orig_Tk
 
 
-def _try_embed_recommended_app_class(mod, host, basename):
+def _embed_exc_detail():
+    """Type, message and deepest frame of the exception being handled (Python 2.7)."""
+    import traceback as _tb
+
+    exc_type, exc_val, exc_tb = sys.exc_info()
+    if exc_type is None:
+        return "unknown error"
+    where = ""
+    try:
+        frames = _tb.extract_tb(exc_tb)
+        if frames:
+            fname, lineno, func, _text = frames[-1]
+            where = " at %s line %s, in %s" % (os.path.basename(fname), lineno, func)
+    except Exception:
+        pass
+    return "%s: %s%s" % (exc_type.__name__, exc_val, where)
+
+
+def _try_embed_recommended_app_class(mod, host, basename, elog=None):
     """Instantiate known root-app classes (X4DApp, XdbReadApp) before generic autodiscover."""
+
+    def _log(msg):
+        # Never let diagnostics break the embed attempt.
+        if elog is None:
+            return
+        try:
+            elog(msg)
+        except Exception:
+            pass
+
     cname = _EMBED_RECOMMENDED_APP_CLASS.get(basename)
     if not cname:
         return False
     cls = getattr(mod, cname, None)
     if not inspect.isclass(cls):
+        _log("Recommended app class: %s not found in %s" % (cname, basename))
         return False
+    # Signature probe: positional, then master=, then root=. A TypeError raised INSIDE the
+    # constructor looks like a signature mismatch here, so report every attempt that failed.
     try:
         inst = cls(host)
     except TypeError:
+        first = _embed_exc_detail()
         try:
             inst = cls(master=host)
         except TypeError:
+            second = _embed_exc_detail()
             try:
                 inst = cls(root=host)
             except Exception:
+                _log(
+                    "Recommended app class %s failed: %s(host) -> %s | %s(master=) -> %s | "
+                    "%s(root=) -> %s" % (cname, cname, first, cname, second, cname, _embed_exc_detail())
+                )
                 return False
         except Exception:
+            _log(
+                "Recommended app class %s failed: %s(host) -> %s | %s(master=) -> %s"
+                % (cname, cname, first, cname, _embed_exc_detail())
+            )
             return False
     except Exception:
+        _log("Recommended app class %s failed: %s(host) -> %s" % (cname, cname, _embed_exc_detail()))
         return False
     _maybe_pack_instance(inst)
     return True
@@ -1579,6 +1621,8 @@ class EmbedHost(tk.Frame):
         self._title = ""
         self._wm_delete = None
         self._tool_subprocess = None
+        self._minsize = [1, 1]
+        self._maxsize = None  # None -> report screen size, as a real Tk root does
 
     def title(self, title=None):
         if title is None:
@@ -1596,10 +1640,28 @@ class EmbedHost(tk.Frame):
         return ""
 
     def minsize(self, width=None, height=None):
-        return
+        # Tk returns [w, h] when called with no args; tools unpack it (min_w, min_h = master.minsize()).
+        if width is None and height is None:
+            return list(self._minsize)
+        if width is not None:
+            self._minsize[0] = width
+        if height is not None:
+            self._minsize[1] = height
 
     def maxsize(self, width=None, height=None):
-        return
+        if width is None and height is None:
+            if self._maxsize is None:
+                try:
+                    return [self.winfo_screenwidth(), self.winfo_screenheight()]
+                except tk.TclError:
+                    return [1, 1]
+            return list(self._maxsize)
+        if self._maxsize is None:
+            self._maxsize = [1, 1]
+        if width is not None:
+            self._maxsize[0] = width
+        if height is not None:
+            self._maxsize[1] = height
 
     def resizable(self, width=None, height=None):
         return
@@ -2515,7 +2577,7 @@ class NavSLMediator(object):
 
             # x4D / xdbRead: construct known app class(host) before hooks (autodiscover may try helper Frames first).
             try:
-                if _try_embed_recommended_app_class(mod, host, basename):
+                if _try_embed_recommended_app_class(mod, host, basename, elog=_elog):
                     _elog("Recommended app class for %s" % basename)
                     if _finalize_embed_visible(host, self.root, trust_hook_nonempty=True):
                         host.title(tab_title)
@@ -2634,86 +2696,96 @@ class NavSLMediator(object):
         else:
             ex_base = os.path.basename(subprocess_path).lower()
             msg = (
-                u"SEPARATE WINDOW (this is normal)\n"
-                u"The tool did not draw inside this tab, so xNAVSL started it in its own window. "
-                u"You can keep using it there.\n\n"
-                u"WHY EMBED OFTEN FAILS\n"
-                u"- The program builds its own main window (class ... Tk / tk.Tk()) instead of a panel "
-                u"that can live inside a tab.\n"
-                u"- Or nothing in the file tells xNAVSL how to build UI inside the tab.\n\n"
-                u"---\n"
-                u"OPTION A — HOOK IN THE TOOL SCRIPT (recommended)\n"
-                u"Add def xnavsl_embed(master) in the same .py the slot opens (Python 2.7). This is the most "
-                u"direct way to tell xNAVSL how to show the tool in the tab.\n\n"
-                u"The tab area is passed as \"master\" — do not create a second tk.Tk() inside the hook.\n\n"
-                u"If you are not editing Python yourself: give this to whoever maintains the script — they add "
-                u"a function named exactly xnavsl_embed at the outer level of the file (same indentation as "
-                u"other top-level def ...), and inside it they build your panel class that lives in a Frame, "
-                u"not as a standalone root window.\n\n"
-                u"MyPanel in the sample is a placeholder — replace it with the real class that builds the UI "
-                u"in a Frame (e.g. xP1P2 uses QCAppPanel in the tab while QCApp(tk.Tk) is for running the file alone).\n\n"
-                u"Sample for the programmer to adapt (Python 2.7, Tkinter):\n\n"
-                u"def xnavsl_embed(master):\n"
-                u"    import Tkinter as tk\n"
-                u"    # Use your real panel class name here (must accept master= or one parent arg).\n"
-                u"    app = MyPanel(master=master)\n"
-                u"    app.pack(fill=tk.BOTH, expand=True)\n"
-                u"    return app\n\n"
-                u"Rules: the name xnavsl_embed must be exact; do not nest it inside def main; if the tool only "
-                u"has a big tk.Tk app class, refactor so a frame-based panel exists first — the sample cannot be pasted alone.\n\n"
-                u"OPTION B — Name the class in embed_overrides.json\n"
-                u"Use when: the .py already has a class that builds its UI as a Tkinter Frame (or similar) "
-                u"that can take the tab as parent, and you prefer JSON over editing the script hook.\n\n"
-                u"Do this:\n"
-                u"  1) Open this file in a text editor (create it empty if needed; name must be exact):\n"
-                u"     embed_overrides.json\n"
-                u"     Full path:\n"
-                u"     %s\n"
-                u"  2) The file must be one JSON object: start with { and end with }.\n"
-                u"  3) Use this exact key (lowercase file name of the script):\n"
-                u"     \"%s\"\n"
-                u"  4) Under that key, set \"class\" to your Frame class name, and \"ctor\" to how the class\n"
-                u"     is called (see below).\n\n"
-                u"Copy-paste pattern (replace PutYourFrameClassNameHere with the real class name):\n"
-                u"{\n"
-                u"  \"%s\": {\n"
-                u"    \"class\": \"PutYourFrameClassNameHere\",\n"
-                u"    \"ctor\": \"master_kw\"\n"
-                u"  }\n"
-                u"}\n\n"
-                u"If Browse already created an entry with \"run_path\" or \"wrapper_for\", do not delete those.\n"
-                u"Add \"class\" and \"ctor\" next to them inside the same { } block for \"%s\".\n\n"
-                u"ctor meaning:\n"
-                u"  \"master_kw\"  -> the class is built like: YourClass(master=something)\n"
-                u"  \"positional\" -> the class is built like: YourClass(something) with one parent argument only\n\n"
-                u"OPTION C — Load a different .py than the slot path (run_path)\n"
-                u"Use when: the button still points at an old path (e.g. site_scripts), but the code you want "
-                u"lives in another file on disk (newer copy, different folder).\n\n"
-                u"Do this:\n"
-                u"  1) Same JSON file as Option B: embed_overrides.json at the path above.\n"
-                u"  2) The key is still the script name the slot refers to (lowercase), here: \"%s\"\n"
-                u"  3) Set \"run_path\" to the full path of the .py file xNAVSL should load instead.\n\n"
-                u"Example (replace the path with your real file):\n"
-                u"  \"%s\": {\n"
-                u"    \"run_path\": \"/full/path/to/the/actual_script.py\"\n"
-                u"  }\n\n"
-                u"You can combine B and C: same key can have both \"run_path\" and \"class\"/\"ctor\" if needed.\n\n"
-                u"If none of the above fixes embedding, you do not need another setting: xNAVSL already falls back "
-                u"to starting the tool in its own window (what you see now).\n\n"
-                u"AUTO WRAPPER\n"
-                u"xNAVSL also writes a thin file under %s and merges embed_overrides.json when you "
-                u"Browse or load a slot path (helps routing; it does not fix a pure Tk() app by itself).\n\n"
-                u"Launched with:\n%s\n\nInterpreter:\n%s"
+                u"THIS TOOL OPENED IN ITS OWN WINDOW\n"
+                u"Nothing is broken. xNAVSL could not draw this tool inside the tab, so it started the\n"
+                u"tool as a separate program. It works exactly the same in that window.\n\n"
+                u"You only need this guide if you WANT the tool inside the tab.\n\n"
+                u"------------------------------------------------------------------\n"
+                u"STEP 1 — LOOK AT THE LIST AT THE BOTTOM OF THIS PAGE\n"
+                u"------------------------------------------------------------------\n"
+                u"Scroll to \"Embed attempts\". It shows what xNAVSL tried and where it stopped.\n"
+                u"If that list is empty or stops without a reason, the tool most likely raised an\n"
+                u"error while building its screen. Start xNAVSL from a terminal and read the\n"
+                u"traceback printed there — that message names the real problem.\n\n"
+                u"------------------------------------------------------------------\n"
+                u"STEP 2 — WHY A TOOL CANNOT GO IN A TAB\n"
+                u"------------------------------------------------------------------\n"
+                u"A tab can only show a tool that builds its screen INSIDE a frame that xNAVSL hands\n"
+                u"it. Many scripts instead open their own window (they call tk.Tk()). Those cannot be\n"
+                u"put in a tab until something tells xNAVSL which part of the script is the panel.\n\n"
+                u"That is all the fixes below do: point xNAVSL at a frame-based panel.\n\n"
+                u"------------------------------------------------------------------\n"
+                u"STEP 3 — PICK ONE FIX\n"
+                u"------------------------------------------------------------------\n\n"
+                u"FIX A — ADD A HOOK TO THE SCRIPT   (best; needs editing the .py)\n\n"
+                u"  Add this function to %s, at the far left margin (not inside another\n"
+                u"  function). The name must be spelled exactly xnavsl_embed:\n\n"
+                u"      def xnavsl_embed(master):\n"
+                u"          import Tkinter as tk\n"
+                u"          app = MyPanel(master=master)     # <- your real panel class\n"
+                u"          app.pack(fill=tk.BOTH, expand=True)\n"
+                u"          return app\n\n"
+                u"  \"master\" is the tab. Never create a tk.Tk() inside this function.\n\n"
+                u"  MyPanel must be a class built on a Frame. If the script only has one big\n"
+                u"  tk.Tk() class, a programmer has to split the screen-building part into a Frame\n"
+                u"  class first. The sample cannot simply be pasted in.\n\n"
+                u"  Working example already in use: xp1p2.py has QCAppPanel (a Frame, used in the\n"
+                u"  tab) and QCApp (a tk.Tk window, used when run on its own).\n\n"
+                u"  Not editing Python yourself? Send this section to whoever maintains the script.\n\n"
+                u"FIX B — NAME THE PANEL CLASS IN A JSON FILE   (no .py editing)\n\n"
+                u"  Use this when the script ALREADY has a Frame-based class; you just have to say\n"
+                u"  which one.\n\n"
+                u"  Edit (create it if missing):\n"
+                u"      %s\n\n"
+                u"  Put this inside, replacing YourFrameClass with the real class name:\n\n"
+                u"      {\n"
+                u"        \"%s\": {\n"
+                u"          \"class\": \"YourFrameClass\",\n"
+                u"          \"ctor\": \"master_kw\"\n"
+                u"        }\n"
+                u"      }\n\n"
+                u"  \"ctor\" says how the class is called:\n"
+                u"      master_kw    ->  YourFrameClass(master=tab)\n"
+                u"      positional   ->  YourFrameClass(tab)\n\n"
+                u"FIX C — POINT THE BUTTON AT A DIFFERENT FILE\n\n"
+                u"  Use this when the button opens an old copy of the script and the good copy lives\n"
+                u"  somewhere else on disk.\n\n"
+                u"  Same JSON file as Fix B:\n\n"
+                u"      {\n"
+                u"        \"%s\": {\n"
+                u"          \"run_path\": \"/full/path/to/the/real_script.py\"\n"
+                u"        }\n"
+                u"      }\n\n"
+                u"------------------------------------------------------------------\n"
+                u"RULES FOR THE JSON FILE (Fix B and Fix C)\n"
+                u"------------------------------------------------------------------\n"
+                u"- One file holds every tool. Start with { and end with }.\n"
+                u"- The key is the script file name in lower case, here: \"%s\"\n"
+                u"- Fix B and Fix C can be combined under the same key.\n"
+                u"- If the key already contains \"run_path\" or \"wrapper_for\", KEEP them and add the\n"
+                u"  new settings beside them. Deleting them breaks the button.\n\n"
+                u"------------------------------------------------------------------\n"
+                u"IF NONE OF THIS WORKS\n"
+                u"------------------------------------------------------------------\n"
+                u"Keep using the separate window. It is a supported way to run the tool, not an\n"
+                u"error, and every feature works there.\n\n"
+                u"------------------------------------------------------------------\n"
+                u"DETAILS FOR THIS TOOL\n"
+                u"------------------------------------------------------------------\n"
+                u"Started from : %s\n"
+                u"Interpreter  : %s\n"
+                u"Auto wrapper : %s\n"
+                u"  (xNAVSL writes a small helper file there when you Browse or load a slot. It only\n"
+                u"   helps routing; it cannot turn a tk.Tk() app into a panel by itself.)"
                 % (
+                    _as_unicode(ex_base),
                     _as_unicode(EMBED_OVERRIDES_FILE),
                     _as_unicode(ex_base),
                     _as_unicode(ex_base),
                     _as_unicode(ex_base),
-                    _as_unicode(ex_base),
-                    _as_unicode(ex_base),
-                    _as_unicode(WRAPPERS_DIR),
                     _as_unicode(subprocess_path),
                     _as_unicode(_python_for_tool_subprocess()),
+                    _as_unicode(WRAPPERS_DIR),
                 )
             )
         msg += _standalone_script_note(_as_unicode(os.path.basename(subprocess_path or primary_embed_path or "")))
