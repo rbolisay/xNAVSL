@@ -133,6 +133,21 @@ def make_classifier(path):
 
 
 # ----------------------------------------------------------------- core logic
+def parse_sp_groups(text):
+    """Split on the word 'and' into output groups: '2700-2600 and 2550-2500'
+    -> [('2700-2600', [2600..2700]), ('2550-2500', [2500..2550])].
+    One group (no 'and') keeps the current single-output behaviour."""
+    groups = []
+    for part in re.split(r"(?i)\band\b", text):
+        part = part.strip().strip(",;").strip()
+        if not part:
+            raise ValueError("Empty shotpoint group next to 'and'")
+        groups.append((part, parse_sp_ranges(part)))
+    if not groups:
+        raise ValueError("No shotpoints given")
+    return groups
+
+
 def parse_sp_ranges(text):
     """'1001-1010, 1015, 1020-1100' -> sorted list of ints. ValueError on junk."""
     spset = set()
@@ -373,7 +388,18 @@ class XP1TrimPanel(tk.Frame):
         self.range_var.trace("w", self._auto_output_name)
         self.source_var.trace("w", self._on_source_change)
         self._on_source_change()
+        self.bind("<Destroy>", self._on_destroy)
         self._start_poll()
+
+    def _on_destroy(self, event):
+        # Cancel the queue poller so no after-callback fires post-destroy
+        # (avoids "invalid command name ..._poll_queue" noise on tab close).
+        if event.widget is self and self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except tk.TclError:
+                pass
+            self._poll_id = None
 
     # ---- UI construction
     def _build_ui(self):
@@ -405,7 +431,7 @@ class XP1TrimPanel(tk.Frame):
                  ).grid(row=4, column=0, sticky="w", **pad)
         tk.Entry(self, textvariable=self.range_var
                  ).grid(row=4, column=1, columnspan=2, sticky="ew", **pad)
-        tk.Label(self, text="e.g. 1001-1010, 1015, 1020-1100", bg=COLOR_BG, fg="#404040"
+        tk.Label(self, text="e.g. 1001-1010, 1015  |  'and' = separate outputs", bg=COLOR_BG, fg="#404040"
                  ).grid(row=4, column=3, sticky="w", **pad)
 
         tk.Label(self, text="Output P1 - Trimmed", bg=COLOR_BG, fg=COLOR_TEXT
@@ -656,8 +682,11 @@ class XP1TrimPanel(tk.Frame):
             return
         src = self.source_var.get().strip()
         if src:
+            parts = [p.strip().strip(",;").strip() for p in
+                     re.split(r"(?i)\band\b", self.range_var.get().strip())]
+            parts = [p for p in parts if p] or [""]
             self.output_name_var.set(
-                default_output_name(src, self.range_var.get().strip()))
+                " and ".join(default_output_name(src, p) for p in parts))
 
     # ---- execute / cancel
     def on_execute(self):
@@ -673,38 +702,91 @@ class XP1TrimPanel(tk.Frame):
             tkMessageBox.showerror(APP_TITLE, "Select a valid Source P1 file.", parent=self)
             return
         try:
-            spset = set(parse_sp_ranges(rng_text))
+            groups = parse_sp_groups(rng_text)  # [(raw_text, sp_list), ...]
         except ValueError as e:
             tkMessageBox.showerror(APP_TITLE, str(e), parent=self)
             return
-        if not out_name:
-            out_name = default_output_name(src, rng_text)
-            self.output_name_var.set(out_name)
-        dst = os.path.join(out_dir, out_name)
-        if os.path.abspath(dst) == os.path.abspath(src):
-            tkMessageBox.showerror(APP_TITLE, "Output would overwrite the source.", parent=self)
+        # Output names: auto-derived per group, or the user's edited field split
+        # on ' and ' (must supply one name per group).
+        if out_name:
+            names = [n.strip() for n in re.split(r"\s+and\s+", out_name) if n.strip()]
+        else:
+            names = []
+        if len(names) != len(groups):
+            if self._out_name_edited[0] and out_name:
+                tkMessageBox.showerror(
+                    APP_TITLE,
+                    "%d shotpoint group(s) but %d output name(s).\n"
+                    "Give one name per group joined by ' and ', or clear the "
+                    "output field to use automatic names." % (len(groups), len(names)),
+                    parent=self)
+                return
+            names = [default_output_name(src, raw) for raw, _ in groups]
+            self.output_name_var.set(" and ".join(names))
+        if len(set(names)) != len(names):
+            tkMessageBox.showerror(APP_TITLE, "Two shotpoint groups produce the same "
+                                   "output name - rename one.", parent=self)
             return
-        if os.path.exists(dst):
-            if not tkMessageBox.askyesno(APP_TITLE, "Output exists:\n%s\nOverwrite?" % dst,
-                                         parent=self):
+        jobs = []
+        existing = []
+        for (raw, sps), name in zip(groups, names):
+            dst = os.path.join(out_dir, name)
+            if os.path.abspath(dst) == os.path.abspath(src):
+                tkMessageBox.showerror(APP_TITLE, "Output would overwrite the source:\n%s"
+                                       % dst, parent=self)
+                return
+            if os.path.exists(dst):
+                existing.append(dst)
+            jobs.append((dst, set(sps), raw))
+        if existing:
+            if not tkMessageBox.askyesno(
+                    APP_TITLE, "Output exists:\n%s\nOverwrite?" % "\n".join(existing),
+                    parent=self):
                 return
         self.cancelled.clear()
         self.exec_btn.config(text="Cancel")
-        self.worker = threading.Thread(target=self._run_job,
-                                       args=(src, dst, spset, rng_text))
+        self.worker = threading.Thread(target=self._run_job, args=(src, jobs))
         self.worker.daemon = True
         self.worker.start()
 
-    def _run_job(self, src, dst, spset, rng_text):
+    def _run_job(self, src, jobs):
+        done_files = []
+        try:
+            for idx, (dst, spset, rng_text) in enumerate(jobs):
+                if self.cancelled.is_set():
+                    break
+                ok = self._run_one(src, dst, spset, rng_text, idx + 1, len(jobs))
+                if ok is None:
+                    break
+                if ok:
+                    done_files.append(dst)
+            if len(jobs) > 1:
+                self.log("=" * 66)
+                if self.cancelled.is_set():
+                    self.log("STOPPED: %d of %d output files completed before cancel."
+                             % (len(done_files), len(jobs)))
+                else:
+                    self.log("ALL DONE: %d verified output files:" % len(done_files))
+                    for d in done_files:
+                        self.log("  %s" % d)
+        except Exception as e:
+            self.log("ERROR: %s" % e)
+        finally:
+            self.msg_queue.put(("done", None))
+
+    def _run_one(self, src, dst, spset, rng_text, idx, total):
+        """One trim+verify. True = PASS/FAIL reported, None = cancelled."""
         t0 = time.time()
         try:
             self.log("=" * 66)
+            if total > 1:
+                self.log("FILE %d of %d" % (idx, total))
             self.log("TRIM   source : %s (%s bytes)" % (src, "{:,}".format(os.path.getsize(src))))
             self.log("       output : %s" % dst)
             self.log("       shotpoints selected: %d  (%s)" % (len(spset), rng_text))
             stats = trim_p111(src, dst, spset, self.log, self._progress, self.cancelled)
             if stats is None:
-                return
+                return None
             self.log("       format : %s" % stats["format"])
             if stats["unknown_types"]:
                 self.log("WARNING: unrecognised record types %s - kept/attributed "
@@ -732,7 +814,7 @@ class XP1TrimPanel(tk.Frame):
             self.log("VERIFY output vs source (byte-for-byte, in order)")
             v = verify_trim(src, dst, spset, self.log, self._progress, self.cancelled)
             if v is None:
-                return
+                return None
             sps_ok = len(stats["sps_kept"]) if v["mismatch"] == 0 else 0
             self.log("Headers checked       : %d, matching: %d"
                      % (v["headers_checked"],
@@ -744,14 +826,16 @@ class XP1TrimPanel(tk.Frame):
             if v["mismatch"] or v["extra_in_output"]:
                 self.log("RESULT: FAIL  (%d mismatches, %d extra lines in output)"
                          % (v["mismatch"], v["extra_in_output"]))
+                passed = False
             else:
                 self.log("RESULT: PASS - every output line matches the source, "
                          "nothing missing, nothing extra.")
+                passed = True
             self.log("Elapsed: %.1f s" % (time.time() - t0))
+            return passed
         except Exception as e:
             self.log("ERROR: %s" % e)
-        finally:
-            self.msg_queue.put(("done", None))
+            return False
 
 
 def _summarize_sps(sps, limit=12):
