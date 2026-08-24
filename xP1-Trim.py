@@ -1,13 +1,19 @@
 #!/usr/bin/env python2.7
 # -*- coding: utf-8 -*-
-# xP1-Trim — trim an IOGP P1/11 file to a selected shotpoint range.
+# xP1-Trim — trim an IOGP P1/11 or UKOOA P1/90 file to a selected shotpoint range.
 # Python 2.7 only (Tkinter), stdlib only: runs on the frozen deployment server.
 #
-# Keeps: every non-per-shot line (OGP/HC/CC/H1 preamble, N1/M1 trailer, anything
-# unrecognised) plus the S1/P1/R1 records whose shotpoint (field index 4, as in
-# TierMaps p111_parser: S1_REC_SPN_IDX = P_REC_SPN_IDX = 4) is in the selected
-# ranges. Lines are copied byte-for-byte; a verify pass re-filters the source
-# and cross-checks the output line-by-line against it.
+# P1/11 (CSV): keeps every non-per-shot line (OGP/HC/CC/H1 preamble, N1/M1
+# trailer, anything unrecognised) plus the S1/P1/R1 records whose shotpoint
+# (field index 4, as in TierMaps p111_parser: S1_REC_SPN_IDX = P_REC_SPN_IDX = 4)
+# is in the selected ranges.
+# P1/90 (fixed width): keeps H* headers plus every record of the selected shot
+# blocks. V/E/S/W/T/C records carry the point number at columns 20-25 (TierMaps
+# p190: slice_field(line, 20, 25)); R records carry no point number and inherit
+# the current shot, exactly as TierMaps parse_p190_receiver_feathers does
+# (current_shotpoint set on 'S', R records attributed to it).
+# Lines are copied byte-for-byte in source order; a verify pass re-filters the
+# source and cross-checks the output line-by-line against it.
 #
 # Embeds in xNAVSL via def xnavsl_embed(master) (Option A hook, same pattern as
 # xShotinfo/xCompare/xSeisCal); runs standalone under __main__.
@@ -32,17 +38,98 @@ COLOR_TEXT = "#000000"
 COLOR_HEADER = "#000033"
 COLOR_STATUS_BG = "#f5f8fc"
 
-APP_TITLE = "xP1-Trim - P1/11 Shotpoint Trimmer"
+APP_TITLE = "xP1-Trim - P1 Shotpoint Trimmer"
 DEFAULT_WIDTH, DEFAULT_HEIGHT = 860, 560
 DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), "xP1TrimConfigs")
 LAST_CONFIG_MARKER = os.path.join(DEFAULT_CONFIG_DIR, ".last_config_path")
 
-# Per-shot record types; shotpoint number at field index 4 (0-based after
+# P1/11 per-shot record types; shotpoint number at field index 4 (0-based after
 # split(',')) — verified against SSFILTREG sample and TierMaps p111_parser.cpp.
 PER_SHOT_TYPES = ("S1", "P1", "R1")
 SPN_IDX = 4
+# P1/11 file-level types that are expected to be kept wholesale. Anything else
+# that is not per-shot is ALSO kept (never dropped), but reported as unknown.
+P111_FILE_LEVEL = ("OGP", "HC", "CC", "C1", "H1", "N1", "M1")
+
+# P1/90 record ids that carry the point number at columns 20-25 (1-based),
+# i.e. line[19:25] — TierMaps p190 slice_field(line, 20, 25). R records carry
+# no point number and inherit the current shot block, as in TierMaps
+# parse_p190_receiver_feathers (current_shotpoint + R attribution).
+P190_SP_SLICE = slice(19, 25)
+P190_KNOWN_TYPES = "HVESWTCR"
 
 PROGRESS_EVERY_LINES = 4000
+
+
+def detect_format(path):
+    """'p111' or 'p190' by extension, else by sniffing the first line."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".p190", ".190"):
+        return "p190"
+    if ext in (".p111", ".111"):
+        return "p111"
+    try:
+        f = open(path, "rb")
+        try:
+            first = f.read(4096).split("\n", 1)[0]
+        finally:
+            f.close()
+    except (IOError, OSError):
+        return "p111"
+    if first.startswith("OGP,"):
+        return "p111"
+    if first[:1] == "H" and first[1:5].isdigit():
+        return "p190"
+    return "p111"
+
+
+class P111Classifier(object):
+    """Stateless: S1/P1/R1 filtered by field index 4; everything else kept."""
+    format_name = "P1/11"
+
+    def rectype(self, line):
+        return line.split(",", 1)[0].strip() if "," in line[:12] else line[:8].strip()
+
+    def classify(self, line):
+        return classify_line(line)
+
+    def unknown_kept_types(self, census):
+        return sorted(t for t in census
+                      if t not in P111_FILE_LEVEL and t not in PER_SHOT_TYPES)
+
+
+class P190Classifier(object):
+    """Stateful: H* kept; V/E/S/W/T/C own the point at cols 20-25 and update the
+    current shot block; R (and anything without a readable point) inherits it."""
+    format_name = "P1/90"
+
+    def __init__(self):
+        self.current = None
+
+    def rectype(self, line):
+        return line[:1] if line[:1] not in ("", "\n", "\r") else "<blank>"
+
+    def classify(self, line):
+        c = line[:1]
+        if c == "H":
+            return False, None
+        if c != "R":
+            s = line[P190_SP_SLICE].strip()
+            if s:
+                try:
+                    spn = int(s)
+                    self.current = spn
+                    return True, spn
+                except ValueError:
+                    pass
+        return True, self.current
+
+    def unknown_kept_types(self, census):
+        return sorted(t for t in census if t[:1] not in P190_KNOWN_TYPES)
+
+
+def make_classifier(path):
+    return P190Classifier() if detect_format(path) == "p190" else P111Classifier()
 
 
 # ----------------------------------------------------------------- core logic
@@ -85,15 +172,33 @@ def classify_line(line):
     return False, None
 
 
+def _own_spn(line, fmt):
+    """Point number carried BY this line (no block inheritance), else None."""
+    if fmt == "p190":
+        c = line[:1]
+        if c in ("H", "R", ""):
+            return None
+        s = line[P190_SP_SLICE].strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    per_shot, spn = classify_line(line)
+    return spn if per_shot else None
+
+
 def scan_sp_extent(path):
     """(first_spn, last_spn) in file order, from the head and a tail chunk only —
     never scans the middle, so it is fast even on multi-GB files."""
+    fmt = detect_format(path)
     first = None
     f = open(path, "rb")
     try:
         for i, line in enumerate(f):
-            per_shot, spn = classify_line(line)
-            if per_shot and spn is not None:
+            spn = _own_spn(line, fmt)
+            if spn is not None:
                 first = spn
                 break
             if i > 100000:
@@ -107,8 +212,8 @@ def scan_sp_extent(path):
             lines = f.read(chunk).split("\n")
             start_idx = 1 if off > 0 else 0  # first element may be a partial line
             for ln in reversed(lines[start_idx:]):
-                per_shot, spn = classify_line(ln)
-                if per_shot and spn is not None:
+                spn = _own_spn(ln, fmt)
+                if spn is not None:
                     last = spn
                     break
             if off == 0:
@@ -127,7 +232,7 @@ def sanitize_range_for_filename(text):
 def default_output_name(source_path, range_text):
     base = os.path.basename(source_path)
     stem, ext = os.path.splitext(base)
-    if ext.lower() not in (".p111", ".111"):
+    if ext.lower() not in (".p111", ".111", ".p190", ".190"):
         stem, ext = base, ".p111"
     rng = sanitize_range_for_filename(range_text)
     suffix = "_SP%s" % rng if rng else "_trimmed"
@@ -138,9 +243,11 @@ def trim_p111(src_path, dst_path, spset, log, progress, cancelled):
     """Stream src -> dst keeping headers + selected shotpoint records.
     Returns stats dict, or None if cancelled (partial output removed)."""
     total_bytes = os.path.getsize(src_path)
+    cls = make_classifier(src_path)
     stats = {"lines": 0, "kept_headers": 0, "kept_records": 0, "skipped_records": 0,
              "bad_spn": 0, "type_census": {}, "kept_by_type": {}, "sps_found": set(),
-             "sps_kept": set(), "out_lines": 0}
+             "sps_kept": set(), "out_lines": 0, "format": cls.format_name,
+             "unknown_types": []}
     read_bytes = 0
     src = open(src_path, "rb")
     dst = open(dst_path, "wb")
@@ -148,9 +255,9 @@ def trim_p111(src_path, dst_path, spset, log, progress, cancelled):
         for line in src:
             stats["lines"] += 1
             read_bytes += len(line)
-            rectype = line.split(",", 1)[0].strip() if "," in line[:12] else line[:8].strip()
+            rectype = cls.rectype(line)
             stats["type_census"][rectype] = stats["type_census"].get(rectype, 0) + 1
-            per_shot, spn = classify_line(line)
+            per_shot, spn = cls.classify(line)
             if per_shot:
                 if spn is None:
                     stats["bad_spn"] += 1
@@ -185,6 +292,7 @@ def trim_p111(src_path, dst_path, spset, log, progress, cancelled):
                 log("Cancelled - could not remove partial output: %s" % e)
     if cancelled.is_set():
         return None
+    stats["unknown_types"] = cls.unknown_kept_types(stats["type_census"])
     return stats
 
 
@@ -192,6 +300,7 @@ def verify_trim(src_path, dst_path, spset, log, progress, cancelled):
     """Re-filter source and compare with output byte-for-byte, in order.
     Returns stats dict, or None if cancelled."""
     total_bytes = os.path.getsize(src_path)
+    cls = make_classifier(src_path)  # fresh state: verify re-derives every decision
     stats = {"headers_checked": 0, "records_checked": 0, "match": 0, "mismatch": 0,
              "extra_in_output": 0, "records_per_sp": {}, "lines": 0}
     read_bytes = 0
@@ -201,7 +310,7 @@ def verify_trim(src_path, dst_path, spset, log, progress, cancelled):
         for line in src:
             stats["lines"] += 1
             read_bytes += len(line)
-            per_shot, spn = classify_line(line)
+            per_shot, spn = cls.classify(line)
             expected = None
             if per_shot:
                 if spn is not None and spn in spset:
@@ -271,7 +380,7 @@ class XP1TrimPanel(tk.Frame):
         pad = dict(padx=6, pady=3)
         self.columnconfigure(1, weight=1)
 
-        hdr = tk.Label(self, text="xP1-Trim  -  P1/11 Shotpoint Trimmer",
+        hdr = tk.Label(self, text="xP1-Trim  -  P1 Shotpoint Trimmer",
                        bg=COLOR_BG, fg=COLOR_HEADER, font=("TkDefaultFont", 11, "bold"))
         hdr.grid(row=0, column=0, columnspan=4, sticky="w", **pad)
 
@@ -485,7 +594,9 @@ class XP1TrimPanel(tk.Frame):
         initdir = os.path.dirname(cur) if cur else os.path.expanduser("~")
         path = tkFileDialog.askopenfilename(
             parent=self, title="Select Source P1/11 File", initialdir=initdir,
-            filetypes=[("P1/11 Files", "*.p111 *.111"), ("All Files", "*.*")])
+            filetypes=[("P1 Files", "*.p111 *.111 *.p190 *.190"),
+                       ("P1/11 Files", "*.p111 *.111"), ("P1/90 Files", "*.p190 *.190"),
+                       ("All Files", "*.*")])
         if path:
             self.source_var.set(path)
 
@@ -525,6 +636,7 @@ class XP1TrimPanel(tk.Frame):
         # No Tkinter access here: worker thread. Staleness is checked in
         # _poll_queue on the main thread using the path carried in the message.
         try:
+            fmt = "P1/90" if detect_format(path) == "p190" else "P1/11"
             first, last = scan_sp_extent(path)
         except (IOError, OSError) as e:
             self.msg_queue.put(("spinfo", (path, "Could not scan source: %s" % e)))
@@ -532,12 +644,12 @@ class XP1TrimPanel(tk.Frame):
         if first is None:
             self.msg_queue.put(("spinfo", (path, "No shotpoint records found in source")))
         elif first == last:
-            self.msg_queue.put(("spinfo", (path, "Source shotpoints: %d (single)" % first)))
+            self.msg_queue.put(("spinfo", (path, "%s source shotpoints: %d (single)" % (fmt, first))))
         else:
             direction = "descending" if first > last else "ascending"
             self.msg_queue.put(("spinfo",
-                                (path, "Source shotpoints: %d -> %d (%s)"
-                                 % (first, last, direction))))
+                                (path, "%s source shotpoints: %d -> %d (%s)"
+                                 % (fmt, first, last, direction))))
 
     def _auto_output_name(self, *args):
         if self._out_name_edited[0]:
@@ -593,6 +705,10 @@ class XP1TrimPanel(tk.Frame):
             stats = trim_p111(src, dst, spset, self.log, self._progress, self.cancelled)
             if stats is None:
                 return
+            self.log("       format : %s" % stats["format"])
+            if stats["unknown_types"]:
+                self.log("WARNING: unrecognised record types %s - kept/attributed "
+                         "conservatively, check the census" % ", ".join(stats["unknown_types"]))
             kept_types = ", ".join("%s=%d" % (k, v)
                                    for k, v in sorted(stats["kept_by_type"].items()))
             census = ", ".join("%s=%d" % (k, v)
