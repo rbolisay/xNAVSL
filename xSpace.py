@@ -15,6 +15,7 @@ from __future__ import print_function, unicode_literals
 import os
 import sys
 import stat
+import json
 import socket
 import hashlib
 import threading
@@ -50,8 +51,48 @@ SERVERS = {
     "navcon1":   {"mount": "/aw-navcon1",   "host": "navcon1"},
     "navsolve1": {"mount": "/aw-navsolve1", "host": "navsolve1"},
     "navsolve2": {"mount": "/aw-navsolve2", "host": "navsolve2"},
-    "storage1":  {"mount": "/aw-storage1",  "host": "storage1"},
+    "navstore1-hs": {"mount": "/DataBig", "host": "navstore1-hs"},
+    "navstore2-hs": {"mount": "/",        "host": "navstore2-hs"},
+    "navstore4-hs": {"mount": "/DataBig", "host": "navstore4-hs"},
 }
+
+# User-managed server list (Add/Remove Server button). When this file exists
+# and is valid it REPLACES the built-in list above; delete it to go back to
+# the defaults.
+SERVERS_FILE = os.path.join(os.path.expanduser("~"), ".xspace_servers.json")
+
+
+def _load_saved_servers():
+    try:
+        if not os.path.isfile(SERVERS_FILE):
+            return
+        with open(SERVERS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        clean = {}
+        for k, v in data.items():
+            if isinstance(v, dict) and v.get("host"):
+                clean[str(k)] = {"mount": str(v.get("mount", "/") or "/"),
+                                 "host": str(v["host"])}
+        if clean:
+            SERVERS.clear()
+            SERVERS.update(clean)
+    except (IOError, OSError, ValueError):
+        pass  # unreadable/corrupt file -> keep built-in defaults
+
+
+def _save_servers():
+    """Persist the current SERVERS dict. Returns an error string or None."""
+    try:
+        with open(SERVERS_FILE, "w") as f:
+            json.dump(SERVERS, f, indent=2, sort_keys=True)
+        return None
+    except (IOError, OSError) as e:
+        return str(e)
+
+
+_load_saved_servers()
 
 # SSH login for all NAVSL server commands (ssh -x user@host '...').
 SSH_USER = "trinop"
@@ -1088,6 +1129,98 @@ def _is_light(hex_color):
 # ---------------------------------------------------------------------------
 # Main panel
 # ---------------------------------------------------------------------------
+class ServerManagerPopup(object):
+    """Small popup to add/remove servers in the dropdown (persisted)."""
+
+    @staticmethod
+    def show(parent, on_change):
+        win = tk.Toplevel(parent)
+        win.title("Add/Remove Server")
+        win.configure(bg=GUI_BG)
+        win.transient(parent.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        pad = dict(padx=8, pady=3)
+        tk.Label(win, text="Server name (ssh host):", bg=GUI_BG, fg=TEXT_FG,
+                 font=FONT_MAIN).grid(row=0, column=0, sticky="w", **pad)
+        name_var = tk.StringVar()
+        tk.Entry(win, textvariable=name_var, width=22).grid(row=0, column=1, **pad)
+
+        tk.Label(win, text="Default path:", bg=GUI_BG, fg=TEXT_FG,
+                 font=FONT_MAIN).grid(row=1, column=0, sticky="w", **pad)
+        mount_var = tk.StringVar(value="/")
+        tk.Entry(win, textvariable=mount_var, width=22).grid(row=1, column=1, **pad)
+
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_var, bg=GUI_BG, fg=STATUS_FG,
+                 font=FONT_SMALL).grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+
+        tk.Label(win, text="Existing servers:", bg=GUI_BG, fg=TEXT_FG,
+                 font=FONT_MAIN).grid(row=2, column=0, sticky="nw", **pad)
+        lb = tk.Listbox(win, height=6, width=24, exportselection=False)
+        lb.grid(row=2, column=1, sticky="ew", **pad)
+
+        def refresh_list():
+            lb.delete(0, tk.END)
+            for k in sorted(SERVERS.keys()):
+                lb.insert(tk.END, "%s  (%s)" % (k, SERVERS[k].get("mount", "/")))
+
+        def selected_name():
+            sel = lb.curselection()
+            if not sel:
+                return None
+            return lb.get(sel[0]).split()[0]
+
+        def on_pick(_event):
+            name = selected_name()
+            if name and name in SERVERS:
+                name_var.set(name)
+                mount_var.set(SERVERS[name].get("mount", "/"))
+        lb.bind("<<ListboxSelect>>", on_pick)
+
+        def do_add():
+            name = name_var.get().strip()
+            mount = mount_var.get().strip() or "/"
+            if not name or any(ch.isspace() for ch in name):
+                status_var.set("Enter a server name without spaces.")
+                return
+            verb = "Updated" if name in SERVERS else "Added"
+            SERVERS[name] = {"mount": mount, "host": name}
+            err = _save_servers()
+            refresh_list()
+            on_change()
+            status_var.set("%s %s.%s" % (verb, name,
+                           ("  (save failed: %s)" % err) if err else ""))
+
+        def do_remove():
+            name = selected_name() or name_var.get().strip()
+            if not name or name not in SERVERS:
+                status_var.set("Select a server to remove.")
+                return
+            if len(SERVERS) <= 1:
+                status_var.set("Cannot remove the last server.")
+                return
+            del SERVERS[name]
+            err = _save_servers()
+            refresh_list()
+            on_change()
+            status_var.set("Removed %s.%s" % (name,
+                           ("  (save failed: %s)" % err) if err else ""))
+
+        btns = tk.Frame(win, bg=GUI_BG)
+        btns.grid(row=3, column=0, columnspan=2, pady=(2, 2))
+        tk.Button(btns, text="Add / Update", bg=BTN_BG, activebackground=BTN_ACTIVE,
+                  command=do_add, width=12).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Remove", bg=BTN_BG, activebackground=BTN_ACTIVE,
+                  command=do_remove, width=10).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Close", bg=BTN_BG, activebackground=BTN_ACTIVE,
+                  command=win.destroy, width=8).pack(side=tk.LEFT, padx=4)
+
+        refresh_list()
+        return win
+
+
 class XSpacePanel(tk.Frame):
     def __init__(self, master, geometry_save_widget=None):
         tk.Frame.__init__(self, master, bg=GUI_BG)
@@ -1121,8 +1254,12 @@ class XSpacePanel(tk.Frame):
         self.server_combo = ttk.Combobox(
             ctrl, textvariable=self.server_var,
             values=sorted(SERVERS.keys()), state="readonly", width=12)
-        self.server_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self.server_combo.pack(side=tk.LEFT, padx=(0, 4))
         self.server_combo.bind("<<ComboboxSelected>>", lambda e: self._on_server_change())
+        tk.Button(
+            ctrl, text="Add/Remove Server", bg=BTN_BG, activebackground=BTN_ACTIVE,
+            command=self._manage_servers,
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Button(
             ctrl, text="Scan Root", bg=BTN_BG, activebackground=BTN_ACTIVE,
@@ -1243,6 +1380,14 @@ class XSpacePanel(tk.Frame):
 
         VisualizeFolderPopup.show(
             self.winfo_toplevel(), server, host, initial, on_select)
+
+    def _manage_servers(self):
+        def on_change():
+            names = sorted(SERVERS.keys())
+            self.server_combo.config(values=names)
+            if self.server_var.get() not in SERVERS and names:
+                self.server_var.set(names[0])
+        ServerManagerPopup.show(self, on_change)
 
     def _rescan_current(self):
         path = self.path_var.get().strip()
