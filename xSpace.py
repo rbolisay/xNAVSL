@@ -1189,7 +1189,7 @@ class ServerManagerPopup(object):
             SERVERS[name] = {"mount": mount, "host": name}
             err = _save_servers()
             refresh_list()
-            on_change()
+            on_change(name)
             status_var.set("%s %s.%s" % (verb, name,
                            ("  (save failed: %s)" % err) if err else ""))
 
@@ -1204,7 +1204,7 @@ class ServerManagerPopup(object):
             del SERVERS[name]
             err = _save_servers()
             refresh_list()
-            on_change()
+            on_change(name)
             status_var.set("Removed %s.%s" % (name,
                            ("  (save failed: %s)" % err) if err else ""))
 
@@ -1316,15 +1316,20 @@ class XSpacePanel(tk.Frame):
         """Root view: df -h filesystem overview."""
         return "/"
 
+    def _scan_default(self):
+        """Scan the selected server's Default path; '/' means df overview."""
+        cfg = SERVERS.get(self.server_var.get(), {})
+        start = os.path.normpath((cfg.get("mount") or "/").strip() or "/")
+        self.path_var.set(start)
+        self._nav_stack = [start]
+        self._start_scan(start)
+
     def _initial_scan(self):
-        root = self._server_root()
-        self.path_var.set(root)
-        self._nav_stack = [root]
-        self._start_scan(root)
+        self._scan_default()
 
     def _on_server_change(self):
         self._nav_stack = []
-        self._scan_root()
+        self._scan_default()
 
     def _scan_root(self):
         root = self._server_root()
@@ -1382,11 +1387,17 @@ class XSpacePanel(tk.Frame):
             self.winfo_toplevel(), server, host, initial, on_select)
 
     def _manage_servers(self):
-        def on_change():
+        def on_change(name=None):
             names = sorted(SERVERS.keys())
             self.server_combo.config(values=names)
             if self.server_var.get() not in SERVERS and names:
                 self.server_var.set(names[0])
+                self._nav_stack = []
+                self._scan_default()
+            elif name is not None and name == self.server_var.get():
+                # Default path of the selected server changed - apply it now.
+                self._nav_stack = []
+                self._scan_default()
         ServerManagerPopup.show(self, on_change)
 
     def _rescan_current(self):
