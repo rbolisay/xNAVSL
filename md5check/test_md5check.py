@@ -559,8 +559,14 @@ def test_audit_regressions(tmp):
               m["lsp"] in (7956, None), True)
 
     # a 5-digit leading run is not sequence 1000
-    check("5-digit leading run refused",
-          M.sequence_key_from_name("10001.line.p111"), "")
+    # md5check.py keys on the first four characters. That grouping is
+    # preserved exactly - the CSV is a deliverable - but now reported.
+    check("5-digit run keyed as legacy did",
+          M.sequence_key_from_name("10001.line.p111"), "1000")
+    check("oversized run is detected for reporting",
+          M.oversized_sequence_run("10001.line.p111"), True)
+    check("normal 4-digit name is not flagged",
+          M.oversized_sequence_run("0001.line.p111"), False)
     check("4-digit leading run still accepted",
           M.sequence_key_from_name("1000.line.p111"), "1000")
 
@@ -622,6 +628,27 @@ def test_audit_regressions(tmp):
     check("header/record linename disagreement: FSP", m["fsp"], 4000)
     check("header/record linename disagreement: LSP", m["lsp"], 2000)
 
+    section("regressions: the attention rule matches md5check.py")
+
+    good, other = "a" * 32, "b" * 32
+    check("matching pair is not flagged", M.needs_attention(good, good), False)
+    check("mismatch is flagged", M.needs_attention(good, other), True)
+    check("missing on ONE side is flagged",
+          M.needs_attention(good, M.M_MISSING), True)
+    check("missing on ONE side (nav) is flagged",
+          M.needs_attention(M.M_MISSING, good), True)
+    # the one md5check.py deliberately stays quiet about: a numbering gap
+    check("missing on BOTH sides is NOT flagged (numbering gap)",
+          M.needs_attention(M.M_MISSING, M.M_MISSING), False)
+    check("duplicate files are flagged",
+          M.needs_attention(M.M_MULTIPLE, good), True)
+    check("vanished source is flagged",
+          M.needs_attention(good, M.M_MISSING_AT_SOURCE), True)
+    check("hash failure is flagged",
+          M.needs_attention(good, M.M_FAILED), True)
+    check("stat failure is flagged",
+          M.needs_attention(good, M.M_META_ERROR), True)
+
     section("regressions: scanner scope")
 
     body = ["CC,1,0,0,LINENAME/SUBLINE = /1000A001/a0001"] + p111_body(1, 9)
@@ -639,10 +666,15 @@ def test_audit_regressions(tmp):
     store = M.Store(os.path.join(tmp, "gapcache.json"))
     store.read_only = True
     rows = M.Scanner(cfg, store).scan()
-    check("stray far-off file does not manufacture phantom rows",
-          len(rows) <= 5, True)
+    # md5check.py fills every sequence from the lowest file to the highest, so
+    # a stray far-off file inflates the range. That output is PRESERVED - the
+    # CSV is a deliverable and must not change - but the scan now says why.
+    check("legacy auto-fill preserved across a stray far-off file",
+          len(rows), 3190)
     check("the real sequences are still reported",
           sorted(r["seq"] for r in rows)[:2], ["0001", "0002"])
+    check("the stray file is reported as a warning",
+          any("stray file" in w for w in store.warnings), True)
 
     # one oddly named file must not re-key the whole job
     nav2 = os.path.join(tmp, "mixnav")

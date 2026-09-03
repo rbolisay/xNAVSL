@@ -61,7 +61,7 @@ try:
 except ImportError:
     msvcrt = None  # POSIX; single-instance lock uses fcntl there
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Bump whenever the P1 metadata extractor changes its output for any input.
 # Cached entries carrying an older version have their METADATA re-parsed
@@ -72,11 +72,11 @@ log = logging.getLogger("md5check_live")
 
 P1_EXTENSIONS = (".p111", ".p190")
 
-# Auto mode lists every sequence between the lowest and highest file it finds so
-# a genuinely missing one shows up as MISSING. It stops filling across a jump
-# wider than this, which is what keeps one stray filename from inventing
-# thousands of phantom rows.
-AUTO_MAX_GAP = 100
+# Auto mode lists every sequence between the lowest and highest file it finds,
+# so a genuinely missing one shows up as MISSING. A jump wider than this is
+# still filled - that is md5check.py's behaviour and the CSV must not change -
+# but it is reported, because it usually means a stray file widened the range.
+AUTO_GAP_WARN = 100
 
 # Cache entries untouched for this many scans are dropped. Long enough that a
 # quiet directory is never re-hashed needlessly, short enough that re-pointing
@@ -879,11 +879,24 @@ def sequence_key_from_name(filename, width=4):
     matched nothing at all in a directory that plainly holds P1 files.
     """
     base = os.path.basename(filename or "").strip()
-    if len(base) >= width and base[:width].isdigit():
-        if base[width:width + 1].isdigit():
-            return ""      # a longer run: 10001 is not sequence 1000
-        return base[:width]
-    return ""
+    if len(base) < width or not base[:width].isdigit():
+        return ""
+    return base[:width]
+
+
+def oversized_sequence_run(filename, width=4):
+    """True when the name's leading digit run is LONGER than the key width.
+
+    md5check.py keys on the first four characters, so 10001... and 10002...
+    both become sequence "1000" and the two unrelated files get compared
+    against each other. That grouping is preserved byte-for-byte - operators
+    read these CSVs and a changed sequence number is a changed deliverable -
+    but the scan now says so out loud instead of leaving it to be discovered.
+    """
+    base = os.path.basename(filename or "").strip()
+    if len(base) <= width or not base[:width].isdigit():
+        return False
+    return base[width].isdigit()
 
 
 def relaxed_sequence_key(filename, width=4):
@@ -1006,6 +1019,112 @@ def compute_md5_and_meta(path):
         return None, None, None
 
 
+def legacy_html_report(rows):
+    """The static report md5check.py wrote, reproduced markup-for-markup.
+
+    The live console at the service's own port replaces this for day-to-day
+    use, but operators have bookmarks and nginx has a location block pointing
+    at the old file, so it is still written when html_report_path is set.
+    Same classes, same colours, same 30-second refresh: an existing bookmark
+    keeps working exactly as before.
+    """
+    p = ['<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+         '<meta http-equiv="refresh" content="30">',
+         '<title>MD5SUM Checker</title><style>body{font-family:Arial,sans-serif;'
+         'margin:20px}table{border-collapse:collapse;width:100%;table-layout:auto;'
+         'box-shadow:0 2px 5px rgba(0,0,0,.1)}',
+         'td,th{border:1px solid #ddd;padding:8px 10px;white-space:nowrap;'
+         'text-align:left;word-break:break-all}th{background-color:#f2f2f2;'
+         'font-weight:bold}',
+         'tr:nth-child(even){background-color:#f9f9f9}tr:hover'
+         '{background-color:#f1f1f1}.missing{background-color:#fff3cd;'
+         'color:#856404;font-weight:bold}',
+         '.missing-source{background-color:#fddfdf;color:#721c24;'
+         'font-weight:bold}.multiple{background-color:#ffeeba;color:#856404;'
+         'font-weight:bold}',
+         '.nomatch{background-color:#f8d7da;color:#721c24;font-weight:bold}'
+         '.match{background-color:#d4edda;color:#155724;font-weight:bold}',
+         '.error{background-color:#f5c6cb;color:#721c24;font-weight:bold}'
+         '.unknown{background-color:#e2e3e5;color:#383d41;font-weight:bold}',
+         '.warning{color:red;font-weight:bold;font-size:1.2em;padding:0 3px}'
+         'h1{text-align:center;font-size:2em;font-weight:bold;'
+         'margin-bottom:10px;color:#333}',
+         '.sequence-summary{font-size:1.2em;font-weight:bold;color:black;'
+         'text-align:center;margin-bottom:20px;padding:10px;border:1px solid '
+         '#eee;background-color:#f8f9fa;border-radius:5px}',
+         '.sequence-summary p{margin:5px 0}</style></head><body>'
+         '<h1>MD5SUM Checker Report</h1><div class="sequence-summary">']
+
+    flagged = [r["seq"] for r in rows if r["attention"]]
+    if flagged:
+        p.append('<p style="color: red;">Please CHECK Sequence(s): %s</p>'
+                 % ", ".join('<span class="warning">%s</span>' % _esc(s)
+                             for s in flagged))
+    else:
+        p.append('<p style="color: green;">All processed sequences appear '
+                 'consistent or have known states within the active data '
+                 'range.</p>')
+
+    p.append('</div><table><tr><th>Sequence Number</th><th>P1 Final</th>'
+             '<th>NAV MD5SUM</th><th>OBP MD5SUM</th><th>MD5SUM XCHECK</th></tr>')
+
+    for r in rows:
+        p1f, nav, obp = str(r["p1_final"]), str(r["nav_md5"]), str(r["obp_md5"])
+        p1_class = "multiple" if "CHECK" in p1f else (
+            "missing" if p1f == M_MISSING else "")
+        nav_class = _side_class(nav)
+        obp_class = _side_class(obp)
+        verdict = r["xcheck"]
+        xcheck_class = _VERDICT_CLASS.get(verdict, "error")
+        if verdict == XCHECK_MATCH:
+            nav_class = nav_class or "match"
+            obp_class = obp_class or "match"
+        elif verdict == XCHECK_MISMATCH:
+            nav_class = nav_class or "nomatch"
+            obp_class = obp_class or "nomatch"
+        elif verdict == XCHECK_INVALID and (
+                "UNKNOWN" in nav or "UNKNOWN" in obp):
+            xcheck_class = "unknown"
+        p.append('<tr><td>%s</td><td class="%s">%s</td><td class="%s">%s</td>'
+                 '<td class="%s">%s</td><td class="%s">%s</td></tr>'
+                 % (_esc(r["seq"]), p1_class, _esc(p1f), nav_class, _esc(nav),
+                    obp_class, _esc(obp), xcheck_class, _esc(verdict)))
+    p.append("</table></body></html>")
+    return "".join(p)
+
+
+_VERDICT_CLASS = {
+    XCHECK_MULTIPLE: "multiple",
+    XCHECK_SOURCE_MISSING: "missing-source",
+    XCHECK_FAILED: "error",
+    XCHECK_META_ERROR: "error",
+    XCHECK_MISSING: "missing",
+    XCHECK_INVALID: "error",
+    XCHECK_MATCH: "match",
+    XCHECK_MISMATCH: "nomatch",
+}
+
+
+def _side_class(value):
+    if "MULTIPLE" in value:
+        return "multiple"
+    if value == M_MISSING:
+        return "missing"
+    if M_MISSING_AT_SOURCE in value:
+        return "missing-source"
+    if any(e in value for e in ("ERROR", "FAILED")):
+        return "error"
+    if "UNKNOWN" in value:
+        return "unknown"
+    return ""
+
+
+def _esc(text):
+    text = "" if text is None else str(text)
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 # ------------------------------------------------------------------- config --
 
 DEFAULT_CONFIG = {
@@ -1023,6 +1142,11 @@ DEFAULT_CONFIG = {
     # Folders the web folder-picker may look inside. The configured NAV/OBP/
     # output parents are always added to this list at request time.
     "browse_roots": ["/usr/local/trinop", "/home", "/mnt", "/media"],
+    # md5check.py also wrote a static report that nginx served. The live
+    # console replaces it, but an operator's bookmark should keep working, so
+    # the same file is still written when this path is set and writable.
+    # Set to "" to stop writing it.
+    "html_report_path": "/usr/share/nginx/html/md5check_report.html",
 }
 
 
@@ -1168,6 +1292,7 @@ class Store(object):
         self.cache = {}
         self.meta_refreshed = 0
         self.listing_error = ""
+        self.warnings = []
         self.rows = []
         self.last_scan = None
         self.last_scan_secs = 0.0
@@ -1295,8 +1420,27 @@ def classify(nav_md5, obp_md5):
     return XCHECK_MATCH if nav == obp else XCHECK_MISMATCH
 
 
-def needs_attention(verdict):
-    return verdict not in (XCHECK_MATCH,)
+def needs_attention(nav_md5, obp_md5):
+    """md5check.py's "Please CHECK Sequence(s)" rule, preserved exactly.
+
+    Note what it deliberately does NOT flag: a sequence missing from BOTH
+    sides. In auto-detect mode the reported range runs from the lowest file to
+    the highest, so an unshot sequence in the middle is a gap in the numbering,
+    not a fault - alarming on it would cry wolf on every job. It still appears
+    in the table as MISSING_FILES; it just does not raise the banner.
+    """
+    nav, obp = str(nav_md5), str(obp_md5)
+    if len(nav) == 32 and len(obp) == 32:
+        return nav != obp
+    if any(kw in nav for kw in PROBLEM_KEYWORDS):
+        return True
+    if any(kw in obp for kw in PROBLEM_KEYWORDS):
+        return True
+    if nav == M_MISSING and len(obp) == 32:
+        return True
+    if obp == M_MISSING and len(nav) == 32:
+        return True
+    return False
 
 
 class Scanner(object):
@@ -1395,6 +1539,7 @@ class Scanner(object):
 
     def scan(self):
         started = time_mod.time()
+        warnings = []
         cfg = self.config.snapshot()
         nav_dir = str(cfg.get("nav_p1_dir") or "")
         obp_dir = str(cfg.get("obp_p1_dir") or "")
@@ -1408,6 +1553,16 @@ class Scanner(object):
         # digits anywhere in the name" - and then for BOTH sides at once, so
         # the two directories can never be keyed differently and report
         # phantom mismatches.
+        for names, side in ((nav_names, "NAV"), (obp_names, "OBP")):
+            wide = [x for x in names if oversized_sequence_run(x)]
+            if wide:
+                warn = ("%s: %d file(s) have more than 4 leading digits, so "
+                        "they are grouped by their first 4 as md5check.py has "
+                        "always done (e.g. %s -> sequence %s)"
+                        % (side, len(wide), wide[0], wide[0][:4]))
+                log.warning("%s", warn)
+                warnings.append(warn)
+
         sides = [names for names in (nav_names, obp_names) if names]
         relaxed = bool(sides) and all(
             not self.group_by_sequence(names, False) for names in sides)
@@ -1438,24 +1593,28 @@ class Scanner(object):
             sequences = sorted(report)
             mode = "ranges"
         elif with_files:
-            # Fill the gaps BETWEEN acquired sequences so a missing sequence is
-            # visible, but never bridge an implausible jump: a single stray
-            # file (a preplot named 3190_... sitting next to sequence 0001)
-            # would otherwise manufacture thousands of phantom MISSING rows.
+            # md5check.py's auto mode: every sequence from the lowest file to
+            # the highest, so a genuinely missing one shows up as MISSING.
+            # Preserved exactly. A jump far wider than a job ever produces is
+            # usually a stray file (a preplot named 3190_... beside sequence
+            # 0001) inflating the range, so it is called out rather than
+            # silently dropped - the rows are still produced either way.
+            lo, hi = min(with_files), max(with_files)
+            sequences = list(range(lo, hi + 1))
             ordered = sorted(with_files)
-            sequences = [ordered[0]]
             for prev, cur in zip(ordered, ordered[1:]):
-                if cur - prev <= AUTO_MAX_GAP:
-                    sequences.extend(range(prev + 1, cur))
-                else:
-                    log.warning("Sequence %04d is %d beyond %04d; not filling "
-                                "the gap (check for a stray file)",
-                                cur, cur - prev, prev)
-                sequences.append(cur)
+                if cur - prev > AUTO_GAP_WARN:
+                    warn = ("sequence %04d is %d beyond %04d - %d gap rows come "
+                            "from that jump; check for a stray file in the P1 "
+                            "directories" % (cur, cur - prev, prev, cur - prev - 1))
+                    log.warning("%s", warn)
+                    warnings.append(warn)
             mode = "auto"
         else:
             sequences = []
             mode = "auto"
+
+        max_with_data = max(with_files) if with_files else -1
 
         rows, hashed = [], 0
         for num in sequences:
@@ -1489,6 +1648,12 @@ class Scanner(object):
                 hints = filename_hints(source_name) if source_name else {}
 
             verdict = classify(nav_md5, obp_md5)
+            attention = needs_attention(nav_md5, obp_md5)
+            if attention and selected is not None and max_with_data >= 0                     and num > max_with_data:
+                # User-defined mode: md5check.py stops warning past the last
+                # sequence that actually has a file, so a range typed ahead of
+                # the job does not raise an alarm for every future sequence.
+                attention = False
             rows.append({
                 "seq": key,
                 "linename": meta.get("linename") or hints.get("linename", ""),
@@ -1499,12 +1664,13 @@ class Scanner(object):
                 "nav_md5": nav_md5,
                 "obp_md5": obp_md5,
                 "xcheck": verdict,
-                "attention": needs_attention(verdict),
+                "attention": attention,
             })
 
         elapsed = time_mod.time() - started
         with self.store.lock:
             self.store.listing_error = " / ".join(e for e in (nav_err, obp_err) if e)
+            self.store.warnings = warnings
             self.store.rows = rows
             self.store.last_scan = utcnow()
             self.store.last_scan_secs = elapsed
@@ -1544,6 +1710,7 @@ class Service(object):
         self.lockfile = None
         self.last_loop = 0.0
         self.scan_lock = threading.Lock()
+        self._html_warned = False
 
     # -- single instance -----------------------------------------------------
 
@@ -1600,7 +1767,26 @@ class Service(object):
         self.store.csv_rows = len(table)
         self.store.csv_path_written = path
         log.info("CSV written: %s (%d rows)", path, len(table))
+        self.emit_html(rows)
         return path, len(table), digest
+
+    def emit_html(self, rows):
+        """Write the legacy static report, if one is configured.
+
+        Best effort by design: on a host where the nginx directory does not
+        exist or is not writable, the console is the report and a failure here
+        must never stop the CSV being delivered.
+        """
+        path = str(self.config.get("html_report_path") or "").strip()
+        if not path:
+            return
+        try:
+            atomic_write(path, legacy_html_report(rows).encode("utf-8"))
+        except (IOError, OSError) as exc:
+            if not self._html_warned:
+                log.warning("Cannot write the static HTML report %s: %s "
+                            "(the live console is unaffected)", path, exc)
+                self._html_warned = True
 
     # -- worker --------------------------------------------------------------
 
@@ -1683,6 +1869,7 @@ class Service(object):
             hashed = self.store.last_scan_hashed
             scans = self.store.scan_count
             last_error = self.store.last_error
+            warnings = list(self.store.warnings)
         attention = [r["seq"] for r in rows if r["attention"]]
         matching = sum(1 for r in rows if r["xcheck"] == XCHECK_MATCH)
         return {
@@ -1707,6 +1894,7 @@ class Service(object):
             "journal_entries": self.journal.count(),
             "journal_path": self.journal.path,
             "error": last_error,
+            "warnings": warnings,
         }
 
 
@@ -2063,9 +2251,18 @@ def main(argv=None):
     if args.command == "rebuild":
         print("Scanning %s and %s ..." % (svc.config.get("nav_p1_dir"),
                                           svc.config.get("obp_p1_dir")))
-        svc.scanner.scan()
+        rows = svc.scanner.scan()
         path, n, _ = svc.emit_csv()
         print("Done: %d sequence(s) -> %s" % (n, path or "(not written)"))
+        # Same summary md5check.py rendered into its HTML report, so a
+        # one-off run tells you what to look at without opening the page.
+        attention = [r["seq"] for r in rows if r["attention"]]
+        if attention:
+            print("ATTENTION: %s" % ", ".join(attention))
+        else:
+            print("ATTENTION: none")
+        for w in svc.store.warnings:
+            print("WARNING: %s" % w)
         return 0
 
     t = threading.Thread(target=svc.monitor_loop, name="monitor")

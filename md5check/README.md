@@ -57,6 +57,53 @@ and the leading four digits stay the authority for grouping, exactly as
 tail window are enough, and the result is cached beside the MD5. Parsing the
 identity of all 68 files of a real 3.7 GB job takes **0.3 s**.
 
+## Feature parity with md5check.py
+
+**No regressions.** `tools/regression_vs_legacy.py` runs the ORIGINAL
+`md5check.py` and this service over byte-identical inputs and compares the five
+columns they share, and `tools/regression_real_data.py` does the same against
+real P1 directories plus the "Please CHECK Sequence(s)" set and the static HTML
+report. Both are in the repo; run them after any change.
+
+```bash
+python2.7 tools/regression_vs_legacy.py --legacy ../md5check.py
+python2.7 tools/regression_real_data.py --legacy ../md5check.py           --nav /path/to/NAV --obp /path/to/OBP
+```
+
+Current result — 30 synthetic scenarios (P111, P190, mixed, every fault state,
+every range form) with the new tool run under **both** interpreters, plus six
+real-data comparisons:
+
+| | result |
+| --- | --- |
+| 30 synthetic scenarios, new tool on python3 | all byte-match |
+| 30 synthetic scenarios, new tool on python2.7 | all byte-match |
+| Real P111, 68 sequences / 3.7 GB, auto-detect | match, incl. attention set and HTML report |
+| Real P111 with `1-40` and with `1-20, 60-99` | match |
+| Real P111, identical directories | match |
+| Real P190 preplots, and preplots vs an empty dir | match |
+
+Every legacy behaviour is carried forward:
+
+| md5check.py / install_md5check.sh | here |
+| --- | --- |
+| `NAV_P1_DIR`, `OBP_P1_DIR`, `OUTPUT_CSV` rewritten by `sed` per job | Setup dialog, validated server-side |
+| `SEQUENCE_RANGES_STR` incl. multi-segment, bare numbers, per-segment truncation at the last sequence with data | identical, same parser semantics |
+| Auto-detect: every sequence from the lowest file to the highest | identical (a jump > 100 is now *reported* as a likely stray file — the rows are still produced) |
+| Sequence grouping on the first 4 filename characters | identical (a longer digit run is now *reported*, still grouped the legacy way) |
+| MD5 cache keyed on mtime + size | identical, plus the parsed P1 metadata beside it |
+| `MISSING`, `MISSING_AT_SOURCE`, `MULTIPLE_FILES_DETECTED`, `COMPUTATION_FAILED`, `METADATA_ERROR` | identical spelling |
+| `P1 Final` incl. `CHECK NAV DIR!` / `CHECK OBP DIR!` | identical |
+| The `MD5SUM XCHECK` verdict ladder, in order | identical |
+| "Please CHECK Sequence(s)" rule — including **not** alarming when a sequence is missing from *both* sides | identical (this one was a real bug found by the harness and fixed) |
+| Static HTML report, 30 s refresh, same CSS classes and colours | still written to `html_report_path` (default `/usr/share/nginx/html/md5check_report.html`), so existing bookmarks keep working; set to `""` to stop. Best-effort — an unwritable path logs once and never blocks the CSV |
+| `*/1 * * * *` cron | one service, **Check Interval (sec)** in Setup |
+| nginx location block, crond checks, `chmod +x` in the installer | not needed — self-served, with a systemd unit or cron watchdog |
+
+The only deliberate difference is an addition: the legacy `endswith()` test is
+case-sensitive and skips a file named `.P111`, where this accepts it. That is
+declared in the harness and checked to be *exactly* that difference.
+
 ## Robustness
 
 Vessel deliveries are not clean. The extractor is built so that a field it cannot
@@ -130,7 +177,7 @@ re-read of the whole job.
 ## Tests
 
 ```bash
-python3 test_md5check.py     # 172 checks, no arguments, no network
+python3 test_md5check.py     # 184 checks, no arguments, no network
 python2.7 test_md5check.py   # same suite, same result
 ```
 
@@ -175,5 +222,7 @@ supervisor: the systemd unit **or** the cron watchdog, never both.
 | `run_md5check.sh` | run / validate / rebuild / verify / install / uninstall / update |
 | `md5check-live.service` | systemd unit (resource-capped, idle I/O) |
 | `watchdog_md5check.sh` | cron alternative to systemd |
-| `test_md5check.py` | standing regression suite (172 checks, 2.7 and 3.6) |
+| `test_md5check.py` | standing unit suite (184 checks, 2.7 and 3.6) |
+| `tools/regression_vs_legacy.py` | differential vs the original md5check.py, 30 scenarios |
+| `tools/regression_real_data.py` | the same, against real P1 directories |
 | `DEPLOY.md` | the navoff1 procedure |

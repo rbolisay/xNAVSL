@@ -75,6 +75,11 @@
   @keyframes warnpulse{0%,100%{box-shadow:0 0 0 0 rgba(228,96,78,.35)}50%{box-shadow:0 0 18px 2px rgba(228,96,78,.35)}}
   .feedwarn .seqs{font-family:var(--mono);font-weight:500;font-size:12.5px;word-break:break-all}
 
+  .scanwarn{display:none;flex-direction:column;gap:6px;padding:11px 18px;border-radius:13px;
+    border:1px solid rgba(232,193,88,.45);background:rgba(232,193,88,.10);
+    color:#F7E6B8;font-size:12.5px;line-height:1.5}
+  .scanwarn.show{display:flex}
+
   .chips{display:flex;gap:9px;flex-wrap:wrap}
   .chip{font-family:var(--mono);font-size:11.5px;color:var(--dim);padding:6px 12px;border-radius:9px;
     background:rgba(255,255,255,.035);border:1px solid var(--line)}
@@ -184,6 +189,8 @@
   <div class="feedwarn glass" id="feedwarn">
     <span>&#9888;&#65039; Please CHECK sequence(s):</span><span class="seqs" id="feedwarnSeqs"></span>
   </div>
+
+  <div class="scanwarn glass" id="scanwarn"></div>
 
   <div class="chips">
     <span class="chip demo">DEMO DATA &mdash; no server connected</span>
@@ -381,6 +388,15 @@
       fw.className="feedwarn glass show";
     }else{
       fw.className="feedwarn glass";
+    }
+    var sw=$("scanwarn"), ws=h.warnings||[];
+    if(ws.length){
+      var wh=[];
+      for(var wi=0;wi<ws.length;wi++)wh.push("<div>⚠ "+esc(ws[wi])+"</div>");
+      sw.innerHTML=wh.join("");
+      sw.className="scanwarn glass show";
+    }else{
+      sw.innerHTML="";sw.className="scanwarn glass";
     }
     $("lastScan").textContent=h.last_scan?h.last_scan.substr(11)+"Z":"—";
     intervalS=h.check_interval_seconds||60;
@@ -595,7 +611,7 @@
     });
     renderChips({sequences:rows.length,matching:rows.length-1,attention:["0003"],
       check_interval_seconds:60,cached_files:rows.length*2,journal_entries:0,
-      version:"demo",last_scan:null,running:true,error:"",
+      version:"demo",last_scan:null,running:true,error:"",warnings:[],
       nav_p1_dir:"(demo)",obp_p1_dir:"(demo)"});
     $("subLbl").textContent="DEMO — open this page from the service to see live data.";
     renderTable();
