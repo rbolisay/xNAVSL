@@ -1,0 +1,13 @@
+{
+  "bind": "0.0.0.0",
+  "check_interval_seconds": 60,
+  "control_password": "swadmin!",
+  "csv_name": "md5check.csv",
+  "journal_dir": "",
+  "nav_p1_dir": "/usr/local/trinop/dbase/links/P111/P111-SSREG",
+  "obp_p1_dir": "/usr/local/trinop/dbase/links/nav2dp/c3190/P111",
+  "output_dir": "/usr/local/trinop/qcfiles/md5sum",
+  "port": 6770,
+  "running": false,
+  "sequence_ranges": ""
+}

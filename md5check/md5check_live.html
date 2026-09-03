@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1 MD5SUM Check</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --deep:#0A0F16; --deep2:#0D141F;
+    --ink:#E7EDF6; --dim:#8FA0B5; --faint:#5C6B80;
+    --line:rgba(255,255,255,.09); --line2:rgba(255,255,255,.14);
+    --glass:rgba(255,255,255,.045); --glass2:rgba(255,255,255,.08);
+    --accent:#57C7A8; --accent-dim:rgba(87,199,168,.16);
+    --danger:#E4604E; --warnc:#E8C158; --info:#5E8BC9;
+    --mono:"IBM Plex Mono",Consolas,"Courier New",monospace;
+    --ui:Barlow,"Segoe UI",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{color-scheme:dark}
+  body{
+    font-family:var(--ui); color:var(--ink); background:var(--deep);
+    background-image:
+      radial-gradient(1100px 520px at 85% -10%, rgba(63,110,150,.18), transparent 60%),
+      radial-gradient(900px 500px at -10% 108%, rgba(59,142,120,.12), transparent 55%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.017) 0 1px, transparent 1px 56px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.017) 0 1px, transparent 1px 56px);
+    background-attachment:fixed; min-height:100vh; padding:18px clamp(12px,2.5vw,32px) 26px;
+    font-variant-numeric:tabular-nums;
+  }
+  .glass{background:linear-gradient(180deg,var(--glass2),var(--glass));
+    -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px);
+    border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 8px 28px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.07)}
+  .wrap{max-width:1680px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+
+  .top{display:flex;align-items:center;gap:18px;padding:14px 18px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:14px;min-width:0}
+  .beacon{width:13px;height:13px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 0 rgba(87,199,168,.5);animation:beat 2.4s infinite;flex:none}
+  .stopped .beacon{background:var(--danger);animation:none;box-shadow:0 0 8px rgba(228,96,78,.6)}
+  .offline .beacon{background:var(--warnc);animation:none;box-shadow:0 0 8px rgba(232,193,88,.5)}
+  @keyframes beat{0%{box-shadow:0 0 0 0 rgba(87,199,168,.45)}70%{box-shadow:0 0 0 11px rgba(87,199,168,0)}100%{box-shadow:0 0 0 0 rgba(87,199,168,0)}}
+  h1{font-size:clamp(17px,2.2vw,22px);font-weight:700;letter-spacing:.02em;white-space:nowrap}
+  .stopped h1{color:var(--danger)}
+  .sub{font-size:12.5px;color:var(--dim);letter-spacing:.06em}
+  .top-right{margin-left:auto;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+
+  .ringbox{display:flex;align-items:center;gap:10px;padding:7px 13px 7px 9px;border-radius:12px}
+  .ringbox svg{display:block}
+  .ring-track{stroke:rgba(255,255,255,.12)}
+  .ring-arc{stroke:var(--accent);transition:stroke-dashoffset .3s linear}
+  .stopped .ring-arc{stroke:var(--faint)}
+  .ringbox.pulse svg{filter:drop-shadow(0 0 7px rgba(87,199,168,.9))}
+  .ring-lbl{font-size:11px;color:var(--dim);letter-spacing:.05em;line-height:1.5}
+  .ring-lbl b{display:block;font-family:var(--mono);font-size:12.5px;color:var(--ink);font-weight:500}
+
+  .btn{font-family:var(--ui);font-size:13.5px;font-weight:600;letter-spacing:.04em;color:var(--ink);
+    padding:9px 18px;border-radius:11px;cursor:pointer;border:1px solid var(--line2);
+    background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.035));
+    -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.10), 0 3px 12px rgba(0,0,0,.30);
+    transition:transform .06s, background .15s, border-color .15s}
+  .btn:hover{background:linear-gradient(180deg,rgba(255,255,255,.15),rgba(255,255,255,.06));border-color:rgba(255,255,255,.24)}
+  .btn:active{transform:translateY(1px)}
+  .btn:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn.run{border-color:rgba(87,199,168,.55);background:linear-gradient(180deg,rgba(87,199,168,.24),rgba(87,199,168,.08));color:#CFF5E8}
+  .btn.run:hover{background:linear-gradient(180deg,rgba(87,199,168,.32),rgba(87,199,168,.13))}
+  .btn.stop{border-color:rgba(228,96,78,.55);background:linear-gradient(180deg,rgba(228,96,78,.22),rgba(228,96,78,.07));color:#F6CFC8}
+  .btn.stop:hover{background:linear-gradient(180deg,rgba(228,96,78,.30),rgba(228,96,78,.12))}
+  .btn.ghost{font-size:12.5px;padding:7px 13px}
+
+  .feedwarn{display:none;align-items:center;gap:12px;padding:12px 18px;border-radius:13px;
+    border:1px solid rgba(228,96,78,.55);background:linear-gradient(180deg,rgba(228,96,78,.20),rgba(228,96,78,.08));
+    color:#F6CFC8;font-weight:600;font-size:13.5px;letter-spacing:.02em;flex-wrap:wrap}
+  .feedwarn.show{display:flex;animation:warnpulse 1.6s infinite}
+  @keyframes warnpulse{0%,100%{box-shadow:0 0 0 0 rgba(228,96,78,.35)}50%{box-shadow:0 0 18px 2px rgba(228,96,78,.35)}}
+  .feedwarn .seqs{font-family:var(--mono);font-weight:500;font-size:12.5px;word-break:break-all}
+
+  .chips{display:flex;gap:9px;flex-wrap:wrap}
+  .chip{font-family:var(--mono);font-size:11.5px;color:var(--dim);padding:6px 12px;border-radius:9px;
+    background:rgba(255,255,255,.035);border:1px solid var(--line)}
+  .chip b{color:var(--ink);font-weight:500}
+  .chip.ok b{color:var(--accent)}
+  .chip.bad b{color:var(--danger)}
+  .chip.demo{display:none;border-color:rgba(232,193,88,.5);color:var(--warnc)}
+  .offline .chip.demo{display:inline-block}
+
+  .ctrl{display:flex;align-items:center;gap:14px;padding:12px 16px;flex-wrap:wrap}
+  .ctrl label{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);font-weight:600}
+  .filters{display:flex;gap:6px}
+  .fbtn{font-family:var(--ui);font-size:12.5px;font-weight:600;letter-spacing:.04em;color:var(--dim);
+    background:none;border:1px solid transparent;border-radius:9px;padding:7px 15px;cursor:pointer}
+  .fbtn:hover{color:var(--ink)}
+  .fbtn.active{color:var(--ink);background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.04));
+    border-color:var(--line2)}
+  input[type=text],input[type=password],input[type=number]{font-family:var(--mono);font-size:13px;color:var(--ink);
+    background:rgba(0,0,0,.30);border:1px solid var(--line2);border-radius:9px;padding:8px 10px;width:100%}
+  input::placeholder{color:var(--faint)}
+  input:focus{border-color:var(--accent)}
+  #q{width:230px}
+  .csvlink{font-family:var(--mono);font-size:12px;color:var(--accent);text-decoration:none;
+    border:1px solid rgba(87,199,168,.4);border-radius:8px;padding:7px 12px}
+  .csvlink:hover{background:var(--accent-dim)}
+  .spacer{margin-left:auto}
+
+  .gridbox{padding:0;overflow:hidden}
+  .tscroll{max-height:calc(100vh - 380px);min-height:220px;overflow:auto}
+  table{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px}
+  thead th{position:sticky;top:0;z-index:2;background:#101822;
+    font-family:var(--ui);font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--dim);text-align:left;padding:11px 12px;border-bottom:1px solid var(--line2);white-space:nowrap}
+  tbody td{font-family:var(--mono);padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.05);
+    white-space:nowrap;color:var(--ink)}
+  tbody tr:hover td{background:rgba(255,255,255,.035)}
+  td.num{text-align:right}
+  td.md5{font-size:11.5px;letter-spacing:-.2px;color:var(--dim)}
+  td.name{max-width:340px;overflow:hidden;text-overflow:ellipsis}
+  .pill{display:inline-block;font-family:var(--ui);font-size:10.5px;font-weight:700;letter-spacing:.06em;
+    padding:4px 9px;border-radius:7px;border:1px solid currentColor;white-space:nowrap}
+  .v-match{color:#4FCE7F}
+  .v-mismatch{color:var(--danger)}
+  .v-missing{color:var(--warnc)}
+  .v-multiple{color:#E98E4D}
+  .v-error{color:var(--danger)}
+  tr.att td:first-child{box-shadow:inset 3px 0 0 var(--danger)}
+  .empty{padding:36px 18px;text-align:center;color:var(--faint);font-size:13px}
+
+  .overlay{position:fixed;inset:0;background:rgba(4,8,13,.72);-webkit-backdrop-filter:blur(4px);
+    backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:20px;z-index:60}
+  .overlay.show{display:flex}
+  .modal{width:min(620px,100%);max-height:90vh;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:15px}
+  .mh{display:flex;align-items:center;gap:12px}
+  .mh h2{font-size:17px;font-weight:700;letter-spacing:.02em}
+  .xbtn{margin-left:auto;background:none;border:none;color:var(--dim);font-size:17px;cursor:pointer;line-height:1}
+  .xbtn:hover{color:var(--ink)}
+  .modal label{display:block;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;margin-bottom:6px}
+  .pathrow{display:flex;gap:8px}
+  .pathrow input{flex:1}
+  .bbtn{flex:none}
+  .sugg{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+  .sugg button,.browse button{font-family:var(--mono);font-size:11.5px;color:var(--dim);text-align:left;cursor:pointer;
+    background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:8px;padding:6px 10px;width:100%}
+  .sugg button:hover,.browse button:hover{color:var(--accent);border-color:rgba(87,199,168,.4)}
+  .browse{display:none;flex-direction:column;gap:4px;margin-top:7px;max-height:190px;overflow:auto;
+    padding:7px;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.28)}
+  .browse.show{display:flex}
+  .row2{display:flex;gap:14px;flex-wrap:wrap}
+  .row2>div{flex:1;min-width:200px}
+  .hint{font-size:12px;color:var(--dim);line-height:1.55}
+  .confirm-txt{font-size:13.5px;color:var(--dim);line-height:1.6}
+  .mfoot{display:flex;gap:10px;justify-content:flex-end;margin-top:2px}
+
+  .toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:9px;z-index:80;max-width:min(430px,92vw)}
+  .toast{font-size:13px;padding:12px 15px;border-radius:11px;border:1px solid var(--line2);
+    background:rgba(16,24,34,.96);box-shadow:0 8px 26px rgba(0,0,0,.45);animation:tin .18s ease-out}
+  .toast.err{border-color:rgba(228,96,78,.6);color:#F6CFC8}
+  .toast.warn{border-color:rgba(232,193,88,.6);color:#F7E6B8}
+  @keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style>
+
+<div class="wrap" id="app">
+  <header class="top glass">
+    <div class="brand">
+      <div class="beacon"></div>
+      <div>
+        <h1 id="statusTitle">P1 MD5SUM Monitoring Active</h1>
+        <div class="sub" id="subLbl">connecting&hellip;</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <div class="ringbox glass" id="ringbox" title="Sweeps once per check interval">
+        <svg width="34" height="34" viewBox="0 0 34 34">
+          <circle class="ring-track" cx="17" cy="17" r="13" fill="none" stroke-width="3"/>
+          <circle class="ring-arc" id="ringArc" cx="17" cy="17" r="13" fill="none" stroke-width="3"
+            stroke-linecap="round" stroke-dasharray="81.68" stroke-dashoffset="81.68" transform="rotate(-90 17 17)"/>
+        </svg>
+        <div class="ring-lbl">LAST CHECK<b id="lastScan">&mdash;</b></div>
+      </div>
+      <button class="btn" id="setupBtn">&#9881; Setup</button>
+      <button class="btn stop" id="runBtn">&#9632; Stop P1 md5sum Monitoring</button>
+    </div>
+  </header>
+
+  <div class="feedwarn glass" id="feedwarn">
+    <span>&#9888;&#65039; Please CHECK sequence(s):</span><span class="seqs" id="feedwarnSeqs"></span>
+  </div>
+
+  <div class="chips">
+    <span class="chip demo">DEMO DATA &mdash; no server connected</span>
+    <span class="chip">SEQUENCES <b id="chipSeq">0</b></span>
+    <span class="chip ok">MATCHING <b id="chipMatch">0</b></span>
+    <span class="chip bad">ATTENTION <b id="chipAtt">0</b></span>
+    <span class="chip">INTERVAL <b id="chipInt">&mdash;</b></span>
+    <span class="chip">CACHED FILES <b id="chipCache">0</b></span>
+    <span class="chip">JOURNAL <b id="chipJournal">0</b></span>
+    <span class="chip ok">SERVER <b id="chipHealth">&hellip;</b></span>
+  </div>
+
+  <div class="ctrl glass">
+    <label for="q">Filter</label>
+    <input type="text" id="q" placeholder="sequence, linename, file&hellip;">
+    <div class="filters">
+      <button class="fbtn active" id="fAll">All</button>
+      <button class="fbtn" id="fAtt">Needs attention</button>
+      <button class="fbtn" id="fMatch">Matching</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="rescanBtn">&#8635; Check now</button>
+    <a class="csvlink" id="csvLink" href="/api/csv" download>&#11015; CSV</a>
+  </div>
+
+  <div class="gridbox glass">
+    <div class="tscroll">
+      <table>
+        <thead><tr>
+          <th>Sequence No.</th><th>Linename</th><th>Subline</th><th>FSP</th><th>LSP</th>
+          <th>P1 Final</th><th>NAV MD5SUM</th><th>OBP MD5SUM</th><th>MD5SUM XCHECK</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="emptyMsg">No sequences yet.</div>
+    </div>
+  </div>
+</div>
+
+<!-- Setup modal -->
+<div class="overlay" id="setupOv">
+  <div class="modal glass">
+    <div class="mh"><h2>&#9881; Setup</h2><button class="xbtn" id="setupX" aria-label="Close">&#10005;</button></div>
+    <div>
+      <label for="navDir">Nav P1 Directory (read-only source)</label>
+      <div class="pathrow"><input type="text" id="navDir"><button class="btn ghost bbtn" data-t="navDir">&#128193;</button></div>
+      <div class="sugg"><button class="sg" data-t="navDir">/usr/local/trinop/dbase/links/P111/P111-SSREG</button></div>
+      <div class="browse" id="browse-navDir"></div>
+    </div>
+    <div>
+      <label for="obpDir">OBP P1 Directory (read-only source)</label>
+      <div class="pathrow"><input type="text" id="obpDir"><button class="btn ghost bbtn" data-t="obpDir">&#128193;</button></div>
+      <div class="sugg"><button class="sg" data-t="obpDir">/usr/local/trinop/dbase/links/nav2dp/c3190/P111</button></div>
+      <div class="browse" id="browse-obpDir"></div>
+    </div>
+    <div>
+      <label for="outDir">Output CSV Directory</label>
+      <div class="pathrow"><input type="text" id="outDir"><button class="btn ghost bbtn" data-t="outDir">&#128193;</button></div>
+      <div class="sugg"><button class="sg" data-t="outDir">/usr/local/trinop/qcfiles/md5sum</button></div>
+      <div class="browse" id="browse-outDir"></div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="interval">Check Interval (sec)</label>
+        <input type="number" id="interval" min="5" max="86400" step="1" value="60">
+      </div>
+      <div>
+        <label for="ranges">Sequence ranges (blank = auto-detect)</label>
+        <input type="text" id="ranges" placeholder="e.g. 3001-3500, 4005">
+      </div>
+    </div>
+    <p class="hint">The two P1 directories are opened <b>read-only</b> &mdash; nothing is written to them, ever.
+    Every sequence's file is hashed once and re-hashed only when its size or timestamp changes, so the check
+    interval is the frequency of the <b>cross-check</b>, not a re-read of every gigabyte. Sequence No., Linename,
+    Subline, FSP and LSP are read out of the P1 files themselves. Paths are validated on the server before
+    saving, and every save is a journal entry. This replaces <code>install_md5check.sh</code> &mdash; a new job
+    only needs these fields changed.</p>
+    <div class="mfoot">
+      <button class="btn ghost" id="setupCancel">Cancel</button>
+      <button class="btn run" id="setupSave">Save settings</button>
+    </div>
+  </div>
+</div>
+
+<!-- Stop confirm modal -->
+<div class="overlay" id="stopOv">
+  <div class="modal glass" style="width:min(440px,100%)">
+    <div class="mh"><h2>Stop P1 md5sum monitoring?</h2><button class="xbtn" id="stopX" aria-label="Close">&#10005;</button></div>
+    <p class="confirm-txt">The cross-check stops and the CSV stops updating. <b>Nothing is deleted</b> &mdash;
+    the MD5 cache is kept, so pressing Start again picks up where it left off and only re-hashes files
+    that changed meanwhile.</p>
+    <div>
+      <label for="stopPw">Password required to stop</label>
+      <input type="password" id="stopPw" placeholder="Password" autocomplete="off">
+    </div>
+    <div class="mfoot">
+      <button class="btn ghost" id="stopCancel">Keep running</button>
+      <button class="btn stop" id="stopYes">&#9632; Stop monitoring</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+(function(){
+  "use strict";
+  var LIVE=false, HEALTH_MS=3000, CIRC=81.68;
+  var running=true, rows=[], filter="all", query="";
+  var intervalS=60, lastScanEpoch=0, lastScanSeen=null, demoJournal=0;
+
+  function $(id){return document.getElementById(id);}
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+
+  function toast(msg,kind){
+    var d=document.createElement("div");
+    d.className="toast"+(kind?" "+kind:"");
+    d.innerHTML=msg;
+    $("toasts").appendChild(d);
+    setTimeout(function(){d.style.opacity="0";setTimeout(function(){
+      if(d.parentNode)d.parentNode.removeChild(d);},250);},4200);
+  }
+
+  function fetchJSON(u){
+    return fetch(u,{cache:"no-store"}).then(function(r){return r.json();});
+  }
+  function postJSON(u,b){
+    return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(b)}).then(function(r){return r.json();});
+  }
+
+  /* ───────── rendering ───────── */
+
+  var VERDICT_CLASS={
+    "MD5SUM_MATCHING":"v-match",
+    "MD5SUM_MISMATCH":"v-mismatch",
+    "MULTIPLE_FILES_DETECTED":"v-multiple",
+    "SOURCE_FILE_MISSING":"v-missing",
+    "MISSING_FILES":"v-missing",
+    "MD5_COMPUTATION_FAILED":"v-error",
+    "FILE_METADATA_ERROR":"v-error",
+    "INVALID_MD5_DATA":"v-error"
+  };
+
+  function shortMd5(v){
+    if(v && v.length===32) return v;
+    return v||"";
+  }
+
+  function visibleRows(){
+    var q=query.trim().toLowerCase();
+    return rows.filter(function(r){
+      if(filter==="att" && !r.attention) return false;
+      if(filter==="match" && r.xcheck!=="MD5SUM_MATCHING") return false;
+      if(!q) return true;
+      return (r.seq+" "+r.linename+" "+r.subline+" "+r.p1_final+" "+r.xcheck)
+             .toLowerCase().indexOf(q)>=0;
+    });
+  }
+
+  function renderTable(){
+    var list=visibleRows(), html=[], i, r;
+    for(i=0;i<list.length;i++){
+      r=list[i];
+      html.push('<tr class="'+(r.attention?"att":"")+'">',
+        '<td>',esc(r.seq),'</td>',
+        '<td>',esc(r.linename),'</td>',
+        '<td>',esc(r.subline),'</td>',
+        '<td class="num">',r.fsp==null?"":esc(r.fsp),'</td>',
+        '<td class="num">',r.lsp==null?"":esc(r.lsp),'</td>',
+        '<td class="name" title="',esc(r.p1_final),'">',esc(r.p1_final),'</td>',
+        '<td class="md5">',esc(shortMd5(r.nav_md5)),'</td>',
+        '<td class="md5">',esc(shortMd5(r.obp_md5)),'</td>',
+        '<td><span class="pill ',(VERDICT_CLASS[r.xcheck]||"v-error"),'">',
+        esc(r.xcheck),'</span></td>','</tr>');
+    }
+    $("tbody").innerHTML=html.join("");
+    $("emptyMsg").style.display=list.length?"none":"block";
+    $("emptyMsg").textContent=rows.length?"No sequences match this filter.":
+      (running?"Waiting for the first check…":"Monitoring is stopped — press Start to check.");
+  }
+
+  function renderChips(h){
+    $("chipSeq").textContent=h.sequences;
+    $("chipMatch").textContent=h.matching;
+    $("chipAtt").textContent=h.attention.length;
+    $("chipInt").textContent=h.check_interval_seconds+"s";
+    $("chipCache").textContent=h.cached_files;
+    $("chipJournal").textContent=h.journal_entries;
+    $("chipHealth").textContent="v"+h.version;
+    var fw=$("feedwarn");
+    if(h.attention.length){
+      $("feedwarnSeqs").textContent=h.attention.join(", ");
+      fw.className="feedwarn glass show";
+    }else{
+      fw.className="feedwarn glass";
+    }
+    $("lastScan").textContent=h.last_scan?h.last_scan.substr(11)+"Z":"—";
+    intervalS=h.check_interval_seconds||60;
+    $("subLbl").textContent=h.error
+      ? "⚠ "+h.error
+      : (h.running
+          ? "NAV "+h.nav_p1_dir+"  ↔  OBP "+h.obp_p1_dir
+          : "Stopped — open ⚙ Setup to point at this job's P1 folders, then press Start. Nothing is read until you start.");
+  }
+
+  /* ───────── run/stop ───────── */
+
+  function setRunningUI(on){
+    running=on;
+    $("app").className="wrap"+(on?"":" stopped")+(LIVE?"":" offline");
+    $("statusTitle").textContent=on?"P1 MD5SUM Monitoring Active":"P1 MD5SUM Monitoring Stopped";
+    var b=$("runBtn");
+    b.className="btn "+(on?"stop":"run");
+    b.innerHTML=on?"■ Stop P1 md5sum Monitoring":"▶ Start P1 md5sum Monitoring";
+  }
+
+  $("runBtn").addEventListener("click",function(){
+    if(running){$("stopPw").value="";$("stopOv").className="overlay show";$("stopPw").focus();}
+    else{
+      if(LIVE)liveControl("start","");
+      else{setRunningUI(true);toast("Monitoring started (demo).");}
+    }
+  });
+
+  function tryStop(){
+    var pw=$("stopPw").value;
+    if(!pw){toast("Password required to stop monitoring.","warn");return;}
+    if(LIVE){liveControl("stop",pw);}
+    else{
+      /* Demo mode only (no server). The real password lives in config.json on
+         the server and is checked there - it must never appear in this file,
+         which anyone who can reach the port can read. */
+      if(pw.length<3){toast("Wrong password — monitoring keeps running.","err");$("stopPw").value="";return;}
+      $("stopOv").className="overlay";setRunningUI(false);
+      toast("Monitoring stopped (demo). Nothing deleted.","warn");
+    }
+  }
+  $("stopYes").addEventListener("click",tryStop);
+  $("stopPw").addEventListener("keydown",function(e){if(e.key==="Enter")tryStop();});
+  $("stopCancel").addEventListener("click",function(){$("stopOv").className="overlay";});
+  $("stopX").addEventListener("click",function(){$("stopOv").className="overlay";});
+
+  function liveControl(action,pw){
+    postJSON("/api/control",{action:action,password:pw||""}).then(function(r){
+      if(r.error){toast(esc(r.error),"err");$("stopPw").value="";return;}
+      $("stopOv").className="overlay";
+      setRunningUI(r.running);
+      toast(r.running?"Monitoring started — first cross-check under way."
+                     :"Monitoring stopped. Nothing deleted.","");
+      pollHealth();
+    }).catch(function(){toast("Server unreachable.","err");});
+  }
+
+  /* ───────── setup modal ───────── */
+
+  $("setupBtn").addEventListener("click",function(){
+    if(LIVE){
+      fetchJSON("/api/config").then(function(c){
+        $("navDir").value=c.nav_p1_dir||"";
+        $("obpDir").value=c.obp_p1_dir||"";
+        $("outDir").value=c.output_dir||"";
+        $("interval").value=c.check_interval_seconds||60;
+        $("ranges").value=c.sequence_ranges||"";
+        $("setupOv").className="overlay show";
+      }).catch(function(){toast("Cannot read settings from the server.","err");});
+    }else{
+      $("outDir").value=$("outDir").value||"/usr/local/trinop/qcfiles/md5sum";
+      $("setupOv").className="overlay show";
+    }
+  });
+  var closeSetup=function(){$("setupOv").className="overlay";};
+  $("setupX").addEventListener("click",closeSetup);
+  $("setupCancel").addEventListener("click",closeSetup);
+
+  /* one-click suggested paths */
+  var sg=document.querySelectorAll(".sugg .sg");
+  for(var i=0;i<sg.length;i++){
+    sg[i].addEventListener("click",function(){$(this.dataset.t).value=this.textContent.trim();});
+  }
+
+  /* server-side folder browser */
+  var bb=document.querySelectorAll(".bbtn");
+  for(var j=0;j<bb.length;j++){
+    bb[j].addEventListener("click",function(){
+      var t=this.dataset.t,box=$("browse-"+t);
+      if(!LIVE){toast("Folder browsing needs the server.","warn");return;}
+      if(box.className.indexOf("show")>=0){box.className="browse";return;}
+      browseTo(t,$(t).value||"");
+    });
+  }
+  function browseTo(t,path){
+    var box=$("browse-"+t);
+    fetchJSON("/api/browse?path="+encodeURIComponent(path)).then(function(r){
+      if(r.error){
+        box.innerHTML='<button class="plain">'+esc(r.error)+'</button>';
+        box.className="browse show";return;
+      }
+      var h='<button data-use="'+esc(r.path)+'"><b>✔ use this folder</b> — '+esc(r.path)+'</button>';
+      if(r.parent&&r.parent!==r.path)h+='<button data-p="'+esc(r.parent)+'">↑ ..</button>';
+      if(r.roots&&r.roots.length){
+        for(var q=0;q<r.roots.length;q++)
+          h+='<button data-p="'+esc(r.roots[q])+'">⌂ '+esc(r.roots[q])+'</button>';
+      }
+      for(var k=0;k<r.dirs.length;k++){
+        var full=(r.path.charAt(r.path.length-1)==="/"?r.path:r.path+"/")+r.dirs[k];
+        h+='<button data-p="'+esc(full)+'">\u{1F4C1} '+esc(r.dirs[k])+'</button>';
+      }
+      box.innerHTML=h;box.className="browse show";
+      var bs=box.querySelectorAll("button");
+      for(var m=0;m<bs.length;m++){
+        bs[m].addEventListener("click",function(){
+          if(this.dataset.use){$(t).value=this.dataset.use;box.className="browse";}
+          else if(this.dataset.p)browseTo(t,this.dataset.p);
+        });
+      }
+    }).catch(function(){toast("Browse failed.","err");});
+  }
+
+  $("setupSave").addEventListener("click",function(){
+    var payload={
+      nav_p1_dir:$("navDir").value.trim(),
+      obp_p1_dir:$("obpDir").value.trim(),
+      output_dir:$("outDir").value.trim(),
+      check_interval_seconds:Number($("interval").value),
+      sequence_ranges:$("ranges").value.trim()
+    };
+    if(LIVE){
+      postJSON("/api/config",payload).then(function(r){
+        if(r.error){toast(esc(r.error),"err");return;}
+        closeSetup();
+        toast("Settings saved · journal #"+r.journal+
+              (r.rescan?" · directories changed, re-checking":""));
+        pollHealth();
+      }).catch(function(){toast("Server unreachable — settings NOT saved.","err");});
+    }else{
+      demoJournal++;closeSetup();
+      toast("Settings saved (demo) · journal #"+demoJournal);
+    }
+  });
+
+  /* ───────── filters ───────── */
+
+  function setFilter(f,btn){
+    filter=f;
+    var fb=document.querySelectorAll(".fbtn");
+    for(var n=0;n<fb.length;n++)fb[n].className="fbtn";
+    btn.className="fbtn active";
+    renderTable();
+  }
+  $("fAll").addEventListener("click",function(){setFilter("all",this);});
+  $("fAtt").addEventListener("click",function(){setFilter("att",this);});
+  $("fMatch").addEventListener("click",function(){setFilter("match",this);});
+  $("q").addEventListener("input",function(){query=this.value;renderTable();});
+
+  $("rescanBtn").addEventListener("click",function(){
+    if(!LIVE){toast("Check now needs the server.","warn");return;}
+    postJSON("/api/rescan",{}).then(function(r){
+      if(r.error){toast(esc(r.error),"warn");return;}
+      toast("Cross-check requested.");
+    }).catch(function(){toast("Server unreachable.","err");});
+  });
+
+  /* ───────── polling ───────── */
+
+  function pollHealth(){
+    return fetchJSON("/api/health").then(function(h){
+      if(!LIVE){LIVE=true;toast("Connected to md5check_live v"+h.version+".");}
+      setRunningUI(h.running);
+      renderChips(h);
+      /* Restart the sweep only when the scan timestamp actually MOVES;
+         stamping it on every poll made the ring reset every 3 s. */
+      if(h.last_scan&&h.last_scan!==lastScanSeen){lastScanSeen=h.last_scan;lastScanEpoch=Date.now();}
+    }).catch(function(){
+      if(LIVE){LIVE=false;toast("Server unreachable.","err");}
+      $("app").className="wrap"+(running?"":" stopped")+" offline";
+      $("chipHealth").textContent="offline";
+    });
+  }
+
+  function pollRows(){
+    if(!LIVE)return Promise.resolve();
+    return fetchJSON("/api/rows").then(function(r){
+      rows=r.rows||[];renderTable();
+    }).catch(function(){});
+  }
+
+  function tickRing(){
+    if(!running||!lastScanEpoch){$("ringArc").setAttribute("stroke-dashoffset",CIRC);return;}
+    var frac=Math.min(1,(Date.now()-lastScanEpoch)/(intervalS*1000));
+    $("ringArc").setAttribute("stroke-dashoffset",CIRC*(1-frac));
+  }
+
+  /* ───────── demo mode (opened as a bare file) ───────── */
+
+  function demoSeed(){
+    var names=[["3682A001","c0001",5471,737],["1702A002","b0002",1786,3313],
+               ["1018A003","c0003",2714,1812],["3646A004","b0004",1053,2419],
+               ["2998A006","b0006",4447,951]];
+    rows=names.map(function(n,k){
+      var seq=String(k+1).padStart?String(k+1).padStart(4,"0"):("000"+(k+1)).slice(-4);
+      var md5="d41d8cd98f00b204e9800998ecf8427"+String(k);
+      var bad=(k===2);
+      return {seq:seq,linename:n[0],subline:n[1],fsp:n[2],lsp:n[3],
+              p1_final:seq+".T26A."+n[0]+"."+n[1]+".GFUNREG.VES.p111",
+              nav_md5:md5,obp_md5:bad?"a41d8cd98f00b204e9800998ecf84270":md5,
+              xcheck:bad?"MD5SUM_MISMATCH":"MD5SUM_MATCHING",attention:bad};
+    });
+    renderChips({sequences:rows.length,matching:rows.length-1,attention:["0003"],
+      check_interval_seconds:60,cached_files:rows.length*2,journal_entries:0,
+      version:"demo",last_scan:null,running:true,error:"",
+      nav_p1_dir:"(demo)",obp_p1_dir:"(demo)"});
+    $("subLbl").textContent="DEMO — open this page from the service to see live data.";
+    renderTable();
+  }
+
+  /* ───────── boot ───────── */
+
+  setRunningUI(true);
+  pollHealth().then(function(){
+    if(LIVE){pollRows();}else{demoSeed();}
+  });
+  /* One driver: health then rows. A second independent rows timer just raced
+     this one into the same endpoint. */
+  setInterval(function(){pollHealth().then(pollRows);},HEALTH_MS);
+  setInterval(tickRing,250);
+})();
+</script>

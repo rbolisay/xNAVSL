@@ -1,0 +1,11 @@
+# The deployable set runs on RHEL 8 / Rocky 8. A CRLF in a shell script makes
+# its shebang "#!/bin/bash\r", which the kernel reports as a missing
+# interpreter, so line endings are pinned here rather than left to the
+# checkout's core.autocrlf.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.service text eol=lf
+*.md text eol=lf
+*.json text eol=lf
