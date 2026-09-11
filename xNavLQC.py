@@ -13,6 +13,9 @@ import math
 import json
 import re
 import subprocess
+import sys
+import tempfile
+import time
 import urllib
 import Tkinter as tk
 import tkFileDialog
@@ -35,6 +38,7 @@ class SequenceCheckerApp(tk.Frame):
     DEFAULT_CONFIG_SAVE_DIR = "/usr/local/trinop/dbase/links/qcfiles/Misc/xNavLQC/"
     DEFAULT_CONFIG_FILENAME = "default_settings.json"
     APP_STATE_FILE = os.path.join(os.path.expanduser("~"), ".xnavlqc_app_state_p27.json")
+    LAUNCH_WATCH_MS = 10000 # Watch Firefox/file-manager launches this long for a failure exit
 
     # User-specified Nippon Paint Blue Aura Theme Colors
     BLUE_AURA_BG = "#B4C8E1"  # Background Color
@@ -52,6 +56,8 @@ class SequenceCheckerApp(tk.Frame):
         self.target_directory = self.DEFAULT_TARGET_DIR
         self.monitoring = False
         self.after_id = None
+        self._retired_results = [] # Result widgets hidden by the last scan, destroyed by the next
+        self._launch_stamps = {} # Last launch time per folder, to ignore double-clicks
 
         self.config_save_dir = self.DEFAULT_CONFIG_SAVE_DIR
         self.config_filename = self.DEFAULT_CONFIG_FILENAME
@@ -610,15 +616,17 @@ class SequenceCheckerApp(tk.Frame):
                     return full
         return None
 
-    def _popen_detached(self, args):
+    def _popen_detached(self, args, output=None):
         """
-        Launch a GUI helper without PIPE on stdout/stderr — piping can block
-        firefox/xdg-open on Linux when buffers fill and nothing reads them.
+        Launch a GUI helper in its own session. stdout/stderr go to `output`
+        (a real file, never a PIPE: an unread pipe can block firefox/xdg-open
+        once its buffer fills), or to /dev/null when no file is given.
         """
-        devnull = open(os.devnull, "w")
+        if output is None:
+            output = open(os.devnull, "w")
         kwargs = {
-            "stdout": devnull,
-            "stderr": devnull,
+            "stdout": output,
+            "stderr": output,
             "env": self._subprocess_env(),
             "close_fds": True,
         }
@@ -626,51 +634,165 @@ class SequenceCheckerApp(tk.Frame):
             kwargs["preexec_fn"] = os.setsid
         return subprocess.Popen(args, **kwargs)
 
+    def _as_text(self, value):
+        """Unicode for dialogs; never raises on odd bytes in paths or error text."""
+        if isinstance(value, unicode):
+            return value
+        if isinstance(value, str):
+            return value.decode("utf-8", "replace")
+        try:
+            return unicode(value)
+        except Exception:
+            return unicode(repr(value))
+
+    def _fs_path(self, path):
+        """
+        Absolute byte-string path. A target directory loaded from a JSON config is
+        unicode, and os.listdir(unicode) returns undecodable file names as bytes,
+        which then raise UnicodeDecodeError in os.path.join. Bytes never mix.
+        """
+        path = os.path.abspath(path)
+        if isinstance(path, unicode):
+            try:
+                path = path.encode(sys.getfilesystemencoding() or "utf-8")
+            except UnicodeError:
+                path = path.encode("utf-8")
+        return path
+
+    def _launch_with_fallbacks(self, attempts, failure_text):
+        """
+        Run attempts [(label, argv), ...] one after another until one works,
+        without blocking the UI. Works means it exited 0 (e.g. firefox handed the
+        URLs to the running browser) or is still running after LAUNCH_WATCH_MS (a
+        GUI program that stayed open). A failed start or a non-zero exit moves on
+        to the next attempt; if all of them fail the user is told why.
+        """
+        errors = []
+
+        def report():
+            tkMessageBox.showerror("Error", failure_text + u"\n\n" + u"\n\n".join(errors))
+
+        def start(index):
+            try:
+                if index >= len(attempts):
+                    report()
+                    return
+                label, args = attempts[index]
+                try:
+                    output = tempfile.TemporaryFile()
+                except (IOError, OSError):
+                    output = None
+                try:
+                    proc = self._popen_detached(args, output)
+                except (OSError, ValueError) as e:
+                    errors.append(u"%s could not start: %s" % (label, self._as_text(e)))
+                    if output is not None:
+                        output.close()
+                    start(index + 1)
+                    return
+                watch(index, proc, output, time.time() + self.LAUNCH_WATCH_MS / 1000.0)
+            except Exception as e:
+                errors.append(self._as_text(e))
+                report()
+
+        def watch(index, proc, output, deadline):
+            try:
+                code = proc.poll()
+                if code is None and time.time() < deadline:
+                    self.after(150, watch, index, proc, output, deadline)
+                    return
+                detail = ""
+                if code and output is not None:
+                    output.seek(0, 2)
+                    output.seek(max(0, output.tell() - 600))
+                    detail = output.read().strip()
+                if output is not None:
+                    output.close()
+                if not code:
+                    return # Exited 0, or still running: it worked
+                errors.append(u"%s exited with code %d%s" % (
+                    attempts[index][0], code, (u":\n" + self._as_text(detail)) if detail else u""))
+                start(index + 1)
+            except Exception as e:
+                errors.append(self._as_text(e))
+                report()
+
+        start(0)
+
+    def _recently_launched(self, key, seconds=2.0):
+        """True if this launch was already started moments ago (double-click)."""
+        now = time.time()
+        if now - self._launch_stamps.get(key, 0) < seconds:
+            return True
+        self._launch_stamps[key] = now
+        return False
+
     def open_folder_files_in_firefox(self, folder_path):
-        if not os.path.isdir(folder_path):
-            tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
-            return
-        firefox_bin = self._find_executable(("firefox", "firefox-esr"))
-        if not firefox_bin:
-            tkMessageBox.showerror(
-                "Error",
-                "Firefox not found in PATH.\n"
-                "Install Firefox or ensure /usr/bin/firefox is available."
-            )
-            return
         try:
-            files = sorted(
-                os.path.join(folder_path, name)
-                for name in os.listdir(folder_path)
-                if os.path.isfile(os.path.join(folder_path, name))
-            )
-        except OSError as e:
-            tkMessageBox.showerror("Error", "Could not read folder:\n" + str(e))
-            return
-        if not files:
-            tkMessageBox.showinfo("No Files", "No files found in folder:\n" + folder_path)
-            return
-        file_uris = [self._path_to_file_uri(f) for f in files]
-        try:
-            self._popen_detached([firefox_bin] + file_uris)
-        except OSError as e:
-            tkMessageBox.showerror("Error", "Could not launch Firefox:\n" + str(e))
+            folder = self._fs_path(folder_path)
+            if self._recently_launched(("firefox", folder)):
+                return
+            if not os.path.isdir(folder):
+                tkMessageBox.showerror("Error", u"Folder not found:\n" + self._as_text(folder_path))
+                return
+            firefox_bin = self._find_executable(("firefox", "firefox-esr"))
+            if not firefox_bin:
+                tkMessageBox.showerror(
+                    "Error",
+                    "Firefox not found in PATH.\n"
+                    "Install Firefox or ensure /usr/bin/firefox is available."
+                )
+                return
+            try:
+                files = sorted(
+                    os.path.join(folder, name)
+                    for name in os.listdir(folder)
+                    if os.path.isfile(os.path.join(folder, name))
+                )
+            except OSError as e:
+                tkMessageBox.showerror("Error", u"Could not read folder:\n" + self._as_text(e))
+                return
+            if not files:
+                tkMessageBox.showinfo("No Files", u"No files found in folder:\n" + self._as_text(folder_path))
+                return
+            file_uris = [self._path_to_file_uri(f) for f in files]
+            self._launch_with_fallbacks(
+                [("Firefox", [firefox_bin] + file_uris)],
+                u"Could not open the files in Firefox:\n" + self._as_text(folder_path))
+        except Exception as e:
+            tkMessageBox.showerror("Error", u"Could not open the files in Firefox:\n" + self._as_text(e))
 
     def open_folder_in_explorer(self, folder_path):
-        if not os.path.isdir(folder_path):
-            tkMessageBox.showerror("Error", "Folder not found:\n" + folder_path)
-            return
-        xdg_bin = self._find_executable(("xdg-open", "nautilus", "nemo", "dolphin"))
-        if not xdg_bin:
-            tkMessageBox.showerror(
-                "Error",
-                "No file manager launcher found (xdg-open, nautilus, etc.)."
-            )
-            return
         try:
-            self._popen_detached([xdg_bin, folder_path])
-        except OSError as e:
-            tkMessageBox.showerror("Error", "Could not open folder in file manager:\n" + str(e))
+            folder = self._fs_path(folder_path)
+            if not os.path.isdir(folder):
+                tkMessageBox.showerror("Error", u"Folder not found:\n" + self._as_text(folder_path))
+                return
+            # xdg-open honours the desktop's default file manager; the rest are
+            # fallbacks for when it is missing or exits non-zero, which used to
+            # fail without a word.
+            attempts = []
+            for label, name, extra in (("xdg-open", "xdg-open", []),
+                                       ("gio open", "gio", ["open"]),
+                                       ("nautilus", "nautilus", ["--new-window"]),
+                                       ("nemo", "nemo", []),
+                                       ("caja", "caja", []),
+                                       ("thunar", "thunar", []),
+                                       ("dolphin", "dolphin", []),
+                                       ("pcmanfm", "pcmanfm", [])):
+                exe = self._find_executable(name)
+                if exe:
+                    attempts.append((label, [exe] + extra + [folder]))
+            if not attempts:
+                tkMessageBox.showerror(
+                    "Error",
+                    "No file manager launcher found (xdg-open, gio, nautilus, etc.)."
+                )
+                return
+            self._launch_with_fallbacks(
+                attempts, u"Could not open folder in file manager:\n" + self._as_text(folder_path))
+        except Exception as e:
+            tkMessageBox.showerror("Error", u"Could not open folder in file manager:\n" + self._as_text(e))
 
     def show_folder_context_menu(self, event, folder_path):
         menu = tk.Menu(self, tearoff=0)
@@ -678,12 +800,25 @@ class SequenceCheckerApp(tk.Frame):
             label="Open in Explorer",
             command=lambda p=folder_path: self.open_folder_in_explorer(p)
         )
-        menu.post(event.x_root, event.y_root)
+        # tk_popup, not post(): it grabs the pointer, so the item also fires on
+        # press-drag-release and a click anywhere else closes the menu. No
+        # grab_release() after it; on X11 that drops the grab straight away.
+        menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
     def scan_sequences(self):
-        for widget in self.results_frame.winfo_children():
+        # Retire the previous result widgets instead of destroying them: a folder
+        # click made while this scan blocks the UI is queued for the old button and
+        # is dropped if that button no longer exists. They are hidden now and
+        # destroyed on the next scan, long after any queued click was delivered.
+        for widget in self._retired_results:
             widget.destroy()
+        self._retired_results = self.results_frame.winfo_children()
+        for widget in self._retired_results:
+            if widget.winfo_manager() == "pack":
+                widget.pack_forget()
+            else:
+                widget.grid_forget()
 
         self.results_frame.configure(bg=self.BLUE_AURA_BG)
 
