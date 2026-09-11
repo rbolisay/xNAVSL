@@ -645,19 +645,22 @@ class SequenceCheckerApp(tk.Frame):
         except Exception:
             return unicode(repr(value))
 
+    def _fs_bytes(self, value):
+        """Byte-string form of a path or file pattern for filesystem calls (see _fs_path)."""
+        if isinstance(value, unicode):
+            try:
+                return value.encode(sys.getfilesystemencoding() or "utf-8")
+            except UnicodeError:
+                return value.encode("utf-8")
+        return value
+
     def _fs_path(self, path):
         """
         Absolute byte-string path. A target directory loaded from a JSON config is
         unicode, and os.listdir(unicode) returns undecodable file names as bytes,
         which then raise UnicodeDecodeError in os.path.join. Bytes never mix.
         """
-        path = os.path.abspath(path)
-        if isinstance(path, unicode):
-            try:
-                path = path.encode(sys.getfilesystemencoding() or "utf-8")
-            except UnicodeError:
-                path = path.encode("utf-8")
-        return path
+        return self._fs_bytes(os.path.abspath(path))
 
     def _launch_with_fallbacks(self, attempts, failure_text):
         """
@@ -826,7 +829,7 @@ class SequenceCheckerApp(tk.Frame):
         for item_id in self.patterns_tree.get_children():
             try:
                 values = self.patterns_tree.item(item_id, "values")
-                pattern = values[0]
+                pattern = self._fs_bytes(values[0])
                 max_dups = int(values[1])
                 patterns_to_check.append((pattern, max_dups))
             except (ValueError, IndexError):
@@ -855,9 +858,12 @@ class SequenceCheckerApp(tk.Frame):
         all_subdirs_count = 0
         filtered_subdirs_count = 0
 
+        # Byte-string paths for every filesystem call below: with a unicode target
+        # (any loaded config) one non-UTF-8 file or folder name crashed the scan.
+        target_dir = self._fs_path(self.target_directory)
         try:
-            subdirs = [d for d in os.listdir(self.target_directory)
-                       if os.path.isdir(os.path.join(self.target_directory, d))]
+            subdirs = [d for d in os.listdir(target_dir)
+                       if os.path.isdir(os.path.join(target_dir, d))]
             all_subdirs_count = len(subdirs)
         except OSError as e:
             tkMessageBox.showerror("Error", "Failed to list subdirectories: " + str(e))
@@ -878,7 +884,7 @@ class SequenceCheckerApp(tk.Frame):
                     continue
 
             filtered_subdirs_count +=1
-            seq_path = os.path.join(self.target_directory, subdir_name)
+            seq_path = os.path.join(target_dir, subdir_name)
             sequence_ok = True
             issue_type = ""
 
@@ -949,7 +955,7 @@ class SequenceCheckerApp(tk.Frame):
             tk.Label(self.results_frame, text=msg, bg=self.BLUE_AURA_BG).pack()
             self.results_frame.update_idletasks()
             self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
-            if self.monitoring: self.after_id = self.after(30000, self.scan_sequences)
+            if self.monitoring: self.after_id = self.after(30000, self._monitor_scan)
             return
 
         rows_per_column = int(math.ceil(n / float(columns)))
@@ -995,7 +1001,21 @@ class SequenceCheckerApp(tk.Frame):
         self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
 
         if self.monitoring:
-            self.after_id = self.after(30000, self.scan_sequences)
+            self.after_id = self.after(30000, self._monitor_scan)
+
+    def _monitor_scan(self):
+        """
+        One monitoring tick. The next tick is scheduled even when the scan stops
+        early on an error or raises; that used to end monitoring silently while
+        the Stop button still showed it running. An error dialog is shown before
+        the next tick is booked, so a lasting error never stacks dialogs.
+        """
+        self.after_id = None
+        try:
+            self.scan_sequences()
+        finally:
+            if self.monitoring and self.after_id is None:
+                self.after_id = self.after(30000, self._monitor_scan)
 
     def start_monitoring(self):
         if not self.target_directory:
@@ -1008,7 +1028,7 @@ class SequenceCheckerApp(tk.Frame):
         self.monitoring = True
         self.start_monitor_button.config(state="disabled")
         self.stop_monitor_button.config(state="normal")
-        self.scan_sequences()
+        self._monitor_scan()
 
     def stop_monitoring(self):
         self.monitoring = False
