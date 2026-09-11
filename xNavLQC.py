@@ -810,6 +810,24 @@ class SequenceCheckerApp(tk.Frame):
         return "break"
 
     def scan_sequences(self):
+        """
+        Scan now. While monitoring, every scan (timer tick or the Scan button)
+        re-arms the one 30 s timer: a pending tick is cancelled first, so the Scan
+        button cannot start a second timer, and the next tick is booked even when
+        the scan stops on an error or raises (that used to end monitoring
+        silently). An error dialog closes before the next tick is booked, so a
+        lasting error never stacks dialogs.
+        """
+        if self.after_id:
+            self.after_cancel(self.after_id)
+            self.after_id = None
+        try:
+            self._scan_once()
+        finally:
+            if self.monitoring:
+                self.after_id = self.after(30000, self.scan_sequences)
+
+    def _scan_once(self):
         # Retire the previous result widgets instead of destroying them: a folder
         # click made while this scan blocks the UI is queued for the old button and
         # is dropped if that button no longer exists. They are hidden now and
@@ -955,7 +973,6 @@ class SequenceCheckerApp(tk.Frame):
             tk.Label(self.results_frame, text=msg, bg=self.BLUE_AURA_BG).pack()
             self.results_frame.update_idletasks()
             self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
-            if self.monitoring: self.after_id = self.after(30000, self._monitor_scan)
             return
 
         rows_per_column = int(math.ceil(n / float(columns)))
@@ -1000,23 +1017,6 @@ class SequenceCheckerApp(tk.Frame):
         self.results_frame.update_idletasks()
         self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
 
-        if self.monitoring:
-            self.after_id = self.after(30000, self._monitor_scan)
-
-    def _monitor_scan(self):
-        """
-        One monitoring tick. The next tick is scheduled even when the scan stops
-        early on an error or raises; that used to end monitoring silently while
-        the Stop button still showed it running. An error dialog is shown before
-        the next tick is booked, so a lasting error never stacks dialogs.
-        """
-        self.after_id = None
-        try:
-            self.scan_sequences()
-        finally:
-            if self.monitoring and self.after_id is None:
-                self.after_id = self.after(30000, self._monitor_scan)
-
     def start_monitoring(self):
         if not self.target_directory:
             tkMessageBox.showerror("Error", "Please select a target directory first.")
@@ -1028,7 +1028,7 @@ class SequenceCheckerApp(tk.Frame):
         self.monitoring = True
         self.start_monitor_button.config(state="disabled")
         self.stop_monitor_button.config(state="normal")
-        self._monitor_scan()
+        self.scan_sequences()
 
     def stop_monitoring(self):
         self.monitoring = False
