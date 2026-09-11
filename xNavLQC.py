@@ -765,35 +765,98 @@ class SequenceCheckerApp(tk.Frame):
         except Exception as e:
             tkMessageBox.showerror("Error", u"Could not open the files in Firefox:\n" + self._as_text(e))
 
+    PRIVATE_BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <!-- Written by xNavLQC for Open in Explorer on a remote display: a private
+       session bus with no service directories, so it auto-starts nothing. -->
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+
+    def _private_bus_config(self):
+        """Path of PRIVATE_BUS_CONFIG, kept next to the app state file; None if unwritable."""
+        path = os.path.join(os.path.expanduser("~"), ".xnavlqc_private_bus.conf")
+        try:
+            with open(path) as f:
+                if f.read() == self.PRIVATE_BUS_CONFIG:
+                    return path
+        except IOError:
+            pass
+        try:
+            with open(path, "w") as f:
+                f.write(self.PRIVATE_BUS_CONFIG)
+            return path
+        except IOError:
+            return None
+
+    def _remote_display_file_manager(self, folder):
+        """
+        Attempts for when our X display is on another machine (ssh -X gives
+        DISPLAY=localhost:10.0; DISPLAY=dws-offline1:0 likewise). xdg-open, gio
+        and nautilus all hand the folder over D-Bus to this user's running
+        Nautilus, which opens it on this host's own screen and still exits 0,
+        so nothing appears. A Nautilus in its own D-Bus session opens on our
+        display. That bus auto-starts no services, so no second dconf or tracker
+        daemon writes the desktop session's settings and search index (a second
+        dconf-service overwrites settings changed meanwhile). Nautilus still
+        reads the settings; it exits about 12 s after its window is closed.
+        Returns [] for a local display or when a piece is missing.
+        """
+        host = os.environ.get("DISPLAY", "").rpartition(":")[0]
+        if host in ("", "unix"):
+            return []
+        env_bin = self._find_executable("env")
+        runner = self._find_executable("dbus-run-session")
+        nautilus = self._find_executable("nautilus")
+        config = self._private_bus_config()
+        if not (env_bin and runner and nautilus and config):
+            return []
+        return [("nautilus on this display",
+                 [env_bin, "GDK_BACKEND=x11", runner, "--config-file=" + config,
+                  "--", nautilus, "--new-window", folder])]
+
     def open_folder_in_explorer(self, folder_path):
         try:
             folder = self._fs_path(folder_path)
             if not os.path.isdir(folder):
                 tkMessageBox.showerror("Error", u"Folder not found:\n" + self._as_text(folder_path))
                 return
-            # xdg-open honours the desktop's default file manager; the rest are
-            # fallbacks for when it is missing or exits non-zero, which used to
-            # fail without a word.
-            attempts = []
-            for label, name, extra in (("xdg-open", "xdg-open", []),
-                                       ("gio open", "gio", ["open"]),
-                                       ("nautilus", "nautilus", ["--new-window"]),
-                                       ("nemo", "nemo", []),
-                                       ("caja", "caja", []),
-                                       ("thunar", "thunar", []),
-                                       ("dolphin", "dolphin", []),
-                                       ("pcmanfm", "pcmanfm", [])):
-                exe = self._find_executable(name)
-                if exe:
-                    attempts.append((label, [exe] + extra + [folder]))
+            failure_text = u"Could not open folder in file manager:\n" + self._as_text(folder_path)
+            attempts = self._remote_display_file_manager(folder)
+            if attempts:
+                failure_text += (u"\n\nThis screen belongs to another machine, so xdg-open was not "
+                                 u"tried: it would open the folder on this host's own screen.")
+            else:
+                # xdg-open honours the desktop's default file manager; the rest are
+                # fallbacks for when it is missing or exits non-zero, which used to
+                # fail without a word.
+                for label, name, extra in (("xdg-open", "xdg-open", []),
+                                           ("gio open", "gio", ["open"]),
+                                           ("nautilus", "nautilus", ["--new-window"]),
+                                           ("nemo", "nemo", []),
+                                           ("caja", "caja", []),
+                                           ("thunar", "thunar", []),
+                                           ("dolphin", "dolphin", []),
+                                           ("pcmanfm", "pcmanfm", [])):
+                    exe = self._find_executable(name)
+                    if exe:
+                        attempts.append((label, [exe] + extra + [folder]))
             if not attempts:
                 tkMessageBox.showerror(
                     "Error",
                     "No file manager launcher found (xdg-open, gio, nautilus, etc.)."
                 )
                 return
-            self._launch_with_fallbacks(
-                attempts, u"Could not open folder in file manager:\n" + self._as_text(folder_path))
+            self._launch_with_fallbacks(attempts, failure_text)
         except Exception as e:
             tkMessageBox.showerror("Error", u"Could not open folder in file manager:\n" + self._as_text(e))
 
