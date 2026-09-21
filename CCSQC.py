@@ -1,11 +1,16 @@
 #!/usr/bin/env python2.7
 # -*- coding: utf-8 -*-
 """
-xStreamerQC - Streamer build sheet vs TRINAV CCS configuration check.
+CCSQC - vessel records vs TRINAV CCS configuration check.
 
-Compares the as-deployed streamer arrangement recorded in an Excel workbook
-(one tab per streamer, top to bottom = head to tail) against the equipment
-TRINAV holds in its CCS printout (HTML/XML "CCS Report").
+Two checks against one CCS printout (HTML/XML "CCS Report"):
+
+  Streamer Order   the as-deployed streamer arrangement recorded in an Excel
+                   workbook, one tab per streamer, top to bottom = head to
+                   tail, against the equipment TRINAV holds.
+  NFH Positions    near field hydrophone offsets from the offsets workbook
+                   against the offsets TRINAV holds, matched on connector,
+                   sub array and position.
 
 Three independent checks per streamer:
 
@@ -60,8 +65,11 @@ ROW_BAD = "#f8cdc8"
 ROW_SKIP = "#e8edf3"
 FG_MUTED = "#5a6570"
 
-APP_TITLE = "xStreamerQC"
-STATE_FILE = os.path.join(os.path.expanduser("~"), ".xstreamerqc_p27.json")
+APP_TITLE = "CCSQC"
+STATE_FILE = os.path.join(os.path.expanduser("~"), ".ccsqc_p27.json")
+# Settings written before the rename, read once so saved paths survive it.
+LEGACY_STATE_FILE = os.path.join(os.path.expanduser("~"),
+                                 ".xstreamerqc_p27.json")
 
 DEFAULT_TOLERANCE = 0.05  # metres; offset residual allowed before flagging
 
@@ -1689,7 +1697,7 @@ class StreamerQCPanel(tk.Frame):
         head.grid_columnconfigure(1, weight=1)
         tk.Label(head, text=APP_TITLE, bg=BG, fg=HEADER_TEXT,
                  font=("Helvetica", 13, "bold")).grid(row=0, column=0, sticky="w")
-        self._label(head, u"Streamer build sheet  vs  TRINAV CCS configuration",
+        self._label(head, u"Vessel records  vs  TRINAV CCS configuration",
                     fg=HEADER_TEXT).grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         # The CCS printout feeds both checks, so it sits above the tabs.
@@ -2415,10 +2423,15 @@ class StreamerQCPanel(tk.Frame):
     # -- state -------------------------------------------------------------
 
     def _load_state(self):
-        try:
-            with open(STATE_FILE) as fh:
-                state = json.load(fh)
-        except (IOError, ValueError):
+        state = None
+        for path in (STATE_FILE, LEGACY_STATE_FILE):
+            try:
+                with open(path) as fh:
+                    state = json.load(fh)
+                break
+            except (IOError, ValueError):
+                continue
+        if state is None:
             return
         if isinstance(state, dict):
             self._state = state
@@ -2475,7 +2488,7 @@ def xnavsl_embed(master):
 
 def main():
     root = tk.Tk()
-    root.title("%s - streamer build sheet vs CCS (Python 2.7)" % APP_TITLE)
+    root.title("%s - vessel records vs TRINAV CCS (Python 2.7)" % APP_TITLE)
     root.configure(bg=BG)
     root.geometry("1180x760")
     StreamerQCPanel(master=root)
