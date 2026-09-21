@@ -296,6 +296,7 @@ class CcsReport(object):
         self.tables = self._split_tables()
         self.summary, self.summary_streamers = self._read_summary()
         self.devices = self._read_devices()
+        self.nfh = self._read_nfh()
 
     # -- structure ---------------------------------------------------------
 
@@ -501,6 +502,96 @@ class CcsReport(object):
     def streamer_numbers(self):
         numbers = set(self.devices.keys()) | set(self.summary_streamers)
         return sorted(numbers)
+
+    # -- near field hydrophones --------------------------------------------
+
+    @staticmethod
+    def parse_nfh_name(name):
+        """
+        'AWA.G01.GS01.UB01.Near Field Hydrophone' -> (1, 1, 1)
+              array ----^     ^-- sub array  ^-- position
+
+        Reads the gun-string and gun-bundle nodes by their prefix where the
+        usual GS / UB names are used, and falls back on position in the chain
+        otherwise, so a differently named hierarchy still resolves.
+        """
+        tokens = []
+        for part in to_text(name).split("."):
+            t = re.match(r"^([A-Za-z]+)0*(\d+)$", part.strip())
+            if t:
+                tokens.append((t.group(1).upper(), int(t.group(2))))
+        if not tokens:
+            return None
+        byprefix = {}
+        for prefix, value in tokens:
+            byprefix.setdefault(prefix, value)
+        array = byprefix.get("G")
+        sub = byprefix.get("GS")
+        pos = byprefix.get("UB")
+        if sub is None or pos is None:
+            # Unknown naming: the last numbered node is the position and the
+            # one before it the sub array.
+            if len(tokens) < 2:
+                return None
+            sub = tokens[-2][1] if sub is None else sub
+            pos = tokens[-1][1] if pos is None else pos
+        return array, sub, pos
+
+    def _read_nfh(self):
+        """Near field hydrophones with their offsets, keyed by connector."""
+        rows = self.table("Near Field Hydrophones", "Near Field Hydrophone",
+                          "NFHs", "NFH")
+        if not rows:
+            return []
+        header = None
+        for row in rows[:5]:
+            keys = [norm_key(c) for c in row]
+            if "name" in keys and any("across" in k for k in keys):
+                header = keys
+                break
+        if header is None:
+            return []
+
+        def col(*wanted):
+            for want in wanted:
+                for i, key in enumerate(header):
+                    if want in key:
+                        return i
+            return None
+
+        i_name = col("name")
+        i_across = col("offsetacross", "across")
+        i_along = col("offsetalong", "along")
+        i_above = col("offsetabove", "above")
+        i_active = col("active")
+        i_conn = col("nfhconnector", "connector")
+
+        out = []
+        for row in rows:
+            if not row or i_name is None or len(row) <= i_name:
+                continue
+            parsed = self.parse_nfh_name(row[i_name])
+            if parsed is None:
+                continue
+            array, sub, pos = parsed
+
+            def raw(i):
+                return to_text(row[i]).strip() if (i is not None and i < len(row)) else u""
+
+            conn = None
+            if i_conn is not None and i_conn < len(row):
+                digits = re.search(r"\d+", to_text(row[i_conn]))
+                if digits:
+                    conn = int(digits.group(0))
+            out.append({
+                "name": to_text(row[i_name]).strip(),
+                "array": array, "sub": sub, "pos": pos, "connector": conn,
+                "across": to_float(raw(i_across)), "across_raw": raw(i_across),
+                "along": to_float(raw(i_along)), "along_raw": raw(i_along),
+                "above": to_float(raw(i_above)), "above_raw": raw(i_above),
+                "active": bool(raw(i_active)) if i_active is not None else None,
+            })
+        return out
 
 
 # ===========================================================================
@@ -741,6 +832,175 @@ def streamer_number(sheet_name, fallback):
     if m:
         return int(m.group(1))
     return fallback
+
+
+# ===========================================================================
+# NFH position sheet (offsets workbook)
+# ===========================================================================
+
+AXES = ("across", "along", "above")
+
+
+def _group_connector(label, fallback):
+    """'NFH 1 - FRONT' -> 1, 'NFH 2 - AFT' -> 2, else FRONT/AFT by name."""
+    text = to_text(label)
+    m = re.search(r"\b(\d+)\b", text)
+    if m:
+        return int(m.group(1))
+    low = text.lower()
+    if "front" in low or "fwd" in low or "forward" in low:
+        return 1
+    if "aft" in low or "rear" in low or "back" in low:
+        return 2
+    return fallback
+
+
+def read_nfh_sheet(path):
+    """
+    Read an NFH position table out of an offsets workbook.
+
+    Looks for a sheet carrying Across / Along / Above headers repeated in
+    side-by-side blocks, one block per NFH connector. Block extent, block
+    order, the number of blocks, the number of sub arrays and positions, and
+    the presence of a Config column are all read from the sheet rather than
+    assumed. Returns (entries, sheet name, notes).
+    """
+    book = read_xlsx(path)
+    best = None
+    for name, rows in book:
+        parsed = _parse_nfh_sheet(rows)
+        if parsed and (best is None or len(parsed[0]) > len(best[0])):
+            best = (parsed[0], name, parsed[1])
+    if best is None:
+        raise XlsxError("no NFH position table found (need Across / Along / "
+                        "Above columns under an NFH heading)")
+    return best
+
+
+def _parse_nfh_sheet(rows):
+    if not rows:
+        return None
+    letters = sorted(set(c for r in rows.values() for c in r), key=col_index)
+
+    # The axis row is the one carrying Across/Along/Above; the row above it
+    # carries the block names, and the row above that may carry a title.
+    axis_row = None
+    for rownum in sorted(rows):
+        found = set()
+        for letter, value in rows[rownum].items():
+            k = norm_key(value)
+            for axis in AXES:
+                if k.startswith(axis):
+                    found.add(axis)
+        if len(found) == 3:
+            axis_row = rownum
+            break
+    if axis_row is None:
+        return None
+
+    # columns of each axis, in sheet order
+    axis_cols = []
+    for letter in letters:
+        value = rows[axis_row].get(letter)
+        if not value:
+            continue
+        k = norm_key(value)
+        for axis in AXES:
+            if k.startswith(axis):
+                axis_cols.append((col_index(letter), letter, axis))
+                break
+    axis_cols.sort()
+
+    # group them into blocks: a new block starts whenever an axis repeats
+    blocks, current, seen = [], [], set()
+    for entry in axis_cols:
+        if entry[2] in seen:
+            blocks.append(current)
+            current, seen = [], set()
+        current.append(entry)
+        seen.add(entry[2])
+    if current:
+        blocks.append(current)
+    blocks = [b for b in blocks if len(b) >= 3]
+    if not blocks:
+        return None
+
+    label_row = axis_row - 1
+    labels = rows.get(label_row, {})
+
+    def block_label(block):
+        """Nearest non-empty label at or left of the block's first column."""
+        start = block[0][0]
+        best, best_col = u"", None
+        for letter, value in labels.items():
+            c = col_index(letter)
+            if c <= start and to_text(value).strip():
+                if best_col is None or c > best_col:
+                    best, best_col = to_text(value).strip(), c
+        return best
+
+    # key columns: look in the label row and the rows above it
+    key_sub = key_pos = None
+    for rownum in (label_row, label_row - 1, axis_row):
+        for letter, value in rows.get(rownum, {}).items():
+            k = norm_key(value)
+            if key_sub is None and ("subarray" in k or k == "array" or "string" in k):
+                key_sub = letter
+            if key_pos is None and ("position" in k or k == "pos" or "bundle" in k):
+                key_pos = letter
+    if key_pos is None:
+        return None
+
+    notes = []
+    entries, last_sub = [], None
+    fallback = 1
+    block_info = []
+    for i, block in enumerate(blocks):
+        label = block_label(block)
+        block_info.append((label, _group_connector(label, i + 1)))
+
+    for rownum in sorted(rows):
+        if rownum <= axis_row:
+            continue
+        cells = rows[rownum]
+        pos_text = to_text(cells.get(key_pos, u"")).strip()
+        sub_text = to_text(cells.get(key_sub, u"")).strip() if key_sub else u""
+        if sub_text:
+            n = re.search(r"(\d+)", sub_text)
+            if n:
+                last_sub = int(n.group(1))
+        if not pos_text:
+            continue
+        n = re.search(r"(\d+)", pos_text)
+        if not n:
+            continue
+        pos = int(n.group(1))
+        for (label, connector), block in zip(block_info, blocks):
+            values = {}
+            for _, letter, axis in block:
+                values[axis] = to_float(cells.get(letter))
+            if all(values.get(a) is None for a in AXES):
+                continue
+            entries.append({
+                "row": rownum, "sub": last_sub, "pos": pos,
+                "block": label, "connector": connector,
+                "across": values.get("across"), "along": values.get("along"),
+                "above": values.get("above"),
+            })
+    if not entries:
+        return None
+    if key_sub is None:
+        notes.append("no Sub Array column found - matched on position only")
+    return entries, notes
+
+
+def col_index(letter):
+    """'A' -> 0, 'Z' -> 25, 'AA' -> 26."""
+    value = 0
+    for ch in to_text(letter).upper():
+        if "A" <= ch <= "Z":
+            value = value * 26 + (ord(ch) - 64)
+    return value - 1
 
 
 # ===========================================================================
@@ -1223,6 +1483,121 @@ def count_check(items, ccs, number, aliases, res):
 
 
 # ===========================================================================
+# NFH cross check
+# ===========================================================================
+
+def printed_decimals(text):
+    """How many decimals the CCS printed for a value: '-0.03' -> 2."""
+    t = to_text(text).strip()
+    if "." in t:
+        return len(t.rsplit(".", 1)[-1].strip())
+    return 0
+
+
+def axis_agrees(sheet_value, ccs_value, ccs_raw, extra=0.0):
+    """
+    The CCS prints offsets rounded for display, so a sheet value agrees when
+    it rounds to what the CCS shows. Returns (ok, difference, tolerance).
+    """
+    if sheet_value is None or ccs_value is None:
+        return False, None, None
+    tol = 0.5 * (10.0 ** -printed_decimals(ccs_raw)) + 1e-9 + extra
+    diff = sheet_value - ccs_value
+    return abs(diff) <= tol, diff, tol
+
+
+def compare_nfh(entries, ccs, extra_tolerance=0.0):
+    """
+    Cross check NFH offsets: workbook against CCS, per connector.
+
+    Matches on (connector, sub array, position). Returns (rows, stats, notes).
+    """
+    by_key = {}
+    for e in entries:
+        by_key.setdefault((e["connector"], e["sub"], e["pos"]), []).append(e)
+
+    ccs_by_key = {}
+    conns = set(d["connector"] for d in ccs.nfh if d["connector"] is not None)
+    for d in ccs.nfh:
+        conn = d["connector"]
+        if conn is None:
+            # No connector column: only unambiguous when the sheet has one block
+            blocks = set(e["connector"] for e in entries)
+            conn = list(blocks)[0] if len(blocks) == 1 else None
+        ccs_by_key.setdefault((conn, d["sub"], d["pos"]), []).append(d)
+
+    rows, notes = [], []
+    stats = {"checked": 0, "ok": 0, "bad": 0, "sheet_only": 0, "ccs_only": 0}
+
+    for key in sorted(set(by_key) | set(ccs_by_key),
+                      key=lambda k: tuple((x is None, x) for x in k)):
+        conn, sub, pos = key
+        sheet = by_key.get(key, [None])[0]
+        dev = ccs_by_key.get(key, [None])[0]
+        row = {"connector": conn, "sub": sub, "pos": pos,
+               "block": sheet["block"] if sheet else u"",
+               "device": dev["name"].rsplit(".", 1)[0] if dev else u"",
+               "row": sheet["row"] if sheet else u""}
+
+        if sheet is not None and dev is None:
+            row.update(status="not in CCS", tag="skip",
+                       note="connector %s not configured in this CCS"
+                            % (conn if conn is not None else "?"))
+            for axis in AXES:
+                row[axis + "_sheet"] = fmt(sheet[axis], 4)
+                row[axis + "_ccs"] = u""
+                row[axis + "_diff"] = u""
+            stats["sheet_only"] += 1
+        elif sheet is None and dev is not None:
+            row.update(status="EXTRA", tag="bad",
+                       note="in CCS, not on the NFH sheet")
+            for axis in AXES:
+                row[axis + "_sheet"] = u""
+                row[axis + "_ccs"] = fmt(dev[axis], 4)
+                row[axis + "_diff"] = u""
+            stats["ccs_only"] += 1
+        else:
+            bad_axes, worst = [], 0.0
+            for axis in AXES:
+                ok, diff, tol = axis_agrees(sheet[axis], dev[axis],
+                                            dev[axis + "_raw"], extra_tolerance)
+                row[axis + "_sheet"] = fmt(sheet[axis], 4)
+                row[axis + "_ccs"] = dev[axis + "_raw"] or fmt(dev[axis], 4)
+                row[axis + "_diff"] = fmt(diff, 4) if diff is not None else u"-"
+                if not ok:
+                    bad_axes.append(axis)
+                if diff is not None:
+                    worst = max(worst, abs(diff))
+            stats["checked"] += 1
+            if bad_axes:
+                stats["bad"] += 1
+                row.update(status="MISMATCH", tag="bad",
+                           note="%s differ beyond the printed precision"
+                                % ", ".join(a.capitalize() for a in bad_axes))
+            else:
+                stats["ok"] += 1
+                row.update(status="OK", tag="ok", note="")
+        rows.append(row)
+
+    places = set()
+    for d in ccs.nfh:
+        for axis in AXES:
+            if d[axis + "_raw"]:
+                places.add(printed_decimals(d[axis + "_raw"]))
+    if places:
+        worst = min(places)
+        unit = 10.0 ** -worst
+        notes.append("CCS prints offsets to %d decimal(s): a difference of "
+                     "%.*f m or more is always caught, anything smaller may "
+                     "round to the same printed value"
+                     % (worst, max(worst, 1), unit))
+    if conns:
+        notes.append("connector(s) present in this CCS: %s"
+                     % ", ".join(str(c) for c in sorted(conns)))
+    return rows, stats, notes
+
+
+# ===========================================================================
 # GUI
 # ===========================================================================
 
@@ -1238,7 +1613,9 @@ class StreamerQCPanel(tk.Frame):
 
         self.ccs_path = tk.StringVar()
         self.sheet_path = tk.StringVar()
+        self.nfh_path = tk.StringVar()
         self.tolerance = tk.StringVar(value="%.2f" % DEFAULT_TOLERANCE)
+        self.nfh_tolerance = tk.StringVar(value="0.000")
         self.start_leadin = tk.IntVar(value=1)
         self.status = tk.StringVar(value="Pick a CCS printout and a streamer workbook, then Compare.")
 
@@ -1249,6 +1626,10 @@ class StreamerQCPanel(tk.Frame):
         self.aliases = {}
         self.ccs = None
         self.sheets = None
+        self.nfh_rows = []
+        self.nfh_stats = {}
+        self.nfh_notes = []
+        self.nfh_sheet_name = u""
 
         self._load_state()
         self._styles()
@@ -1269,6 +1650,16 @@ class StreamerQCPanel(tk.Frame):
                 style.map(name + ".Heading", background=[("active", BTN_ACTIVE)])
             except tk.TclError:
                 pass
+        try:
+            # Own notebook style so the shell's tab colours are untouched.
+            style.configure("SQC.TNotebook", background=BG, borderwidth=0)
+            style.configure("SQC.TNotebook.Tab", background=BTN, foreground=TEXT,
+                            padding=[14, 5], font=("Helvetica", 9, "bold"))
+            style.map("SQC.TNotebook.Tab",
+                      background=[("selected", BG), ("active", BTN_ACTIVE)],
+                      foreground=[("selected", HEADER_TEXT)])
+        except tk.TclError:
+            pass
         try:
             style.configure("SQC.TCombobox", fieldbackground=PANEL, background=BTN)
             style.configure("SQC.Vertical.TScrollbar", background=BTN)
@@ -1301,6 +1692,7 @@ class StreamerQCPanel(tk.Frame):
         self._label(head, u"Streamer build sheet  vs  TRINAV CCS configuration",
                     fg=HEADER_TEXT).grid(row=0, column=1, sticky="w", padx=(10, 0))
 
+        # The CCS printout feeds both checks, so it sits above the tabs.
         inputs = tk.Frame(self, bg=BG)
         inputs.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         inputs.grid_columnconfigure(1, weight=1)
@@ -1312,15 +1704,47 @@ class StreamerQCPanel(tk.Frame):
         self._button(inputs, "Folder...", self.pick_ccs_dir, 9).grid(row=0, column=2, padx=2)
         self._button(inputs, "File...", self.pick_ccs_file, 8).grid(row=0, column=3, padx=2)
 
-        self._label(inputs, "Streamer sheet:").grid(row=1, column=0, sticky="w", pady=2)
+        self.tabs = ttk.Notebook(self, style="SQC.TNotebook")
+        self.tabs.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 2))
+        streamer_tab = tk.Frame(self.tabs, bg=BG)
+        nfh_tab = tk.Frame(self.tabs, bg=BG)
+        self.tabs.add(streamer_tab, text="  Streamer Order  ")
+        self.tabs.add(nfh_tab, text="  NFH Positions  ")
+        self._build_streamer_tab(streamer_tab)
+        self._build_nfh_tab(nfh_tab)
+
+        bar = tk.Frame(self, bg=BG)
+        bar.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        tk.Label(bar, textvariable=self.status, bg=BG, fg=HEADER_TEXT,
+                 anchor="w", font=("Helvetica", 9, "bold")).pack(fill="x")
+        tk.Label(bar, bg=BG, fg=FG_MUTED, anchor="w", justify="left",
+                 font=("Helvetica", 8), text=(
+                     u"OK = matches   SERIAL = Q-Fin serial differs   "
+                     u"OFFSET = section out of place   MISSING / EXTRA = on "
+                     u"one side only   COUNT = type total differs.   "
+                     u"TRINAV positions Q-Fins and ITXs only, so two sections "
+                     u"between the same pair of them can be swapped without "
+                     u"changing any offset - that case is not detectable.")
+                 ).pack(fill="x")
+
+    # -- tab 1: streamer order ---------------------------------------------
+
+    def _build_streamer_tab(self, parent):
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        inputs = tk.Frame(parent, bg=BG)
+        inputs.grid(row=0, column=0, sticky="ew", pady=(6, 2))
+        inputs.grid_columnconfigure(1, weight=1)
+        self._label(inputs, "Streamer sheet:").grid(row=0, column=0, sticky="w", pady=2)
         self.sheet_box = ttk.Combobox(inputs, textvariable=self.sheet_path,
                                       style="SQC.TCombobox")
-        self.sheet_box.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
-        self._button(inputs, "Folder...", self.pick_sheet_dir, 9).grid(row=1, column=2, padx=2)
-        self._button(inputs, "File...", self.pick_sheet_file, 8).grid(row=1, column=3, padx=2)
+        self.sheet_box.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+        self._button(inputs, "Folder...", self.pick_sheet_dir, 9).grid(row=0, column=2, padx=2)
+        self._button(inputs, "File...", self.pick_sheet_file, 8).grid(row=0, column=3, padx=2)
 
         opts = tk.Frame(inputs, bg=BG)
-        opts.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        opts.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         self._button(opts, "Compare", self.run, 10).pack(side="left")
         tk.Checkbutton(opts, text="Start at lead-in (ignore DCK / SRU / SRA)",
                        variable=self.start_leadin, bg=BG, fg=TEXT,
@@ -1332,9 +1756,9 @@ class StreamerQCPanel(tk.Frame):
         self._button(opts, "Export...", self.export, 10).pack(side="right")
         self._button(opts, "Type map...", self.show_typemap, 11).pack(side="right", padx=6)
 
-        panes = tk.PanedWindow(self, orient="vertical", bg=BG, sashwidth=6,
+        panes = tk.PanedWindow(parent, orient="vertical", bg=BG, sashwidth=6,
                                sashrelief="raised", bd=0)
-        panes.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 2))
+        panes.grid(row=1, column=0, sticky="nsew", pady=(4, 2))
 
         top = tk.Frame(panes, bg=BG)
         self._label(top, "Streamers", bold=True, fg=HEADER_TEXT).pack(anchor="w")
@@ -1369,19 +1793,56 @@ class StreamerQCPanel(tk.Frame):
             style="SQC.Treeview", height=14)
         panes.add(bottom, minsize=160)
 
-        bar = tk.Frame(self, bg=BG)
-        bar.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
-        tk.Label(bar, textvariable=self.status, bg=BG, fg=HEADER_TEXT,
-                 anchor="w", font=("Helvetica", 9, "bold")).pack(fill="x")
-        tk.Label(bar, bg=BG, fg=FG_MUTED, anchor="w", justify="left",
-                 font=("Helvetica", 8), text=(
-                     u"OK = matches   SERIAL = Q-Fin serial differs   "
-                     u"OFFSET = section out of place   MISSING / EXTRA = device on "
-                     u"one side only   COUNT = type total differs.   "
-                     u"TRINAV positions Q-Fins and ITXs only, so two sections "
-                     u"between the same pair of them can be swapped without "
-                     u"changing any offset - that case is not detectable.")
-                 ).pack(fill="x")
+    # -- tab 2: NFH positions ----------------------------------------------
+
+    def _build_nfh_tab(self, parent):
+        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        inputs = tk.Frame(parent, bg=BG)
+        inputs.grid(row=0, column=0, sticky="ew", pady=(6, 2))
+        inputs.grid_columnconfigure(1, weight=1)
+        self._label(inputs, "Offsets workbook:").grid(row=0, column=0, sticky="w", pady=2)
+        self.nfh_box = ttk.Combobox(inputs, textvariable=self.nfh_path,
+                                    style="SQC.TCombobox")
+        self.nfh_box.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+        self._button(inputs, "Folder...", self.pick_nfh_dir, 9).grid(row=0, column=2, padx=2)
+        self._button(inputs, "File...", self.pick_nfh_file, 8).grid(row=0, column=3, padx=2)
+
+        opts = tk.Frame(inputs, bg=BG)
+        opts.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self._button(opts, "Cross check", self.run_nfh, 12).pack(side="left")
+        self._label(opts, "Extra tolerance (m):").pack(side="left", padx=(12, 3))
+        tk.Entry(opts, textvariable=self.nfh_tolerance, width=7,
+                 bg=PANEL, fg=TEXT).pack(side="left")
+        self._label(opts, "(added to the CCS printed precision)",
+                    fg=FG_MUTED).pack(side="left", padx=(4, 0))
+        self._button(opts, "Export...", self.export_nfh, 10).pack(side="right")
+
+        self.nfh_title = self._label(parent, "NFH offsets - workbook vs CCS",
+                                     bold=True, fg=HEADER_TEXT)
+        self.nfh_title.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        holder = tk.Frame(parent, bg=BG)
+        holder.grid(row=2, column=0, sticky="nsew")
+        self.nfh_tree = self._tree(
+            holder,
+            columns=[("conn", "NFH", 110, "w"),
+                     ("sub", "Sub array", 70, "center"),
+                     ("pos", "Position", 65, "center"),
+                     ("device", "CCS device", 175, "w"),
+                     ("across_sheet", "Across sheet", 90, "e"),
+                     ("across_ccs", "Across CCS", 85, "e"),
+                     ("across_diff", "d Across", 80, "e"),
+                     ("along_sheet", "Along sheet", 90, "e"),
+                     ("along_ccs", "Along CCS", 85, "e"),
+                     ("along_diff", "d Along", 80, "e"),
+                     ("above_sheet", "Above sheet", 90, "e"),
+                     ("above_ccs", "Above CCS", 85, "e"),
+                     ("above_diff", "d Above", 80, "e"),
+                     ("status", "Status", 95, "center"),
+                     ("note", "Note", 230, "w")],
+            style="SQC.Treeview", height=20)
 
     def _tree(self, parent, columns, style, height):
         wrap = tk.Frame(parent, bg=BG)
@@ -1462,23 +1923,26 @@ class StreamerQCPanel(tk.Frame):
         if path:
             self.sheet_path.set(path)
 
+    def pick_nfh_dir(self):
+        folder = tkFileDialog.askdirectory(title="Folder holding the offsets workbook")
+        if folder:
+            self._fill_box(self.nfh_box, self.nfh_path, folder, ("*.xlsx", "*.xlsm"))
+
+    def pick_nfh_file(self):
+        path = tkFileDialog.askopenfilename(
+            title="Offsets workbook (NFH positions)",
+            filetypes=[("Excel workbook", "*.xlsx *.xlsm"), ("All files", "*")])
+        if path:
+            self.nfh_path.set(path)
+
     # -- run ---------------------------------------------------------------
 
     def run(self):
-        ccs_path = self.ccs_path.get().strip()
         sheet_path = self.sheet_path.get().strip()
-        if os.path.isdir(ccs_path):
-            self._fill_box(self.ccs_box, self.ccs_path, ccs_path,
-                           ("*.html", "*.htm", "*.xml"), self._looks_like_ccs)
-            ccs_path = self.ccs_path.get().strip()
         if os.path.isdir(sheet_path):
             self._fill_box(self.sheet_box, self.sheet_path, sheet_path,
                            ("*.xlsx", "*.xlsm"))
             sheet_path = self.sheet_path.get().strip()
-
-        if not os.path.isfile(ccs_path):
-            tkMessageBox.showwarning(APP_TITLE, "Pick a CCS printout first.")
-            return
         if not os.path.isfile(sheet_path):
             tkMessageBox.showwarning(APP_TITLE, "Pick a streamer workbook first.")
             return
@@ -1490,11 +1954,7 @@ class StreamerQCPanel(tk.Frame):
 
         self.status.set("Reading...")
         self.update_idletasks()
-        try:
-            self.ccs = CcsReport(ccs_path)
-        except (CcsError, IOError) as exc:
-            tkMessageBox.showerror(APP_TITLE, "CCS printout:\n%s" % exc)
-            self.status.set("CCS printout could not be read.")
+        if self._load_ccs() is None:
             return
         try:
             self.sheets, problems = read_sheets(sheet_path)
@@ -1509,6 +1969,170 @@ class StreamerQCPanel(tk.Frame):
 
         self._fill_summary(problems)
         self._save_state()
+
+    def _load_ccs(self):
+        """Read the CCS printout shared by both checks; None on failure."""
+        path = self.ccs_path.get().strip()
+        if os.path.isdir(path):
+            self._fill_box(self.ccs_box, self.ccs_path, path,
+                           ("*.html", "*.htm", "*.xml"), self._looks_like_ccs)
+            path = self.ccs_path.get().strip()
+        if not os.path.isfile(path):
+            tkMessageBox.showwarning(APP_TITLE, "Pick a CCS printout first.")
+            return None
+        try:
+            self.ccs = CcsReport(path)
+        except (CcsError, IOError) as exc:
+            tkMessageBox.showerror(APP_TITLE, "CCS printout:\n%s" % exc)
+            self.status.set("CCS printout could not be read.")
+            return None
+        return self.ccs
+
+    def run_nfh(self):
+        """Cross check NFH offsets: offsets workbook against the CCS."""
+        if self._load_ccs() is None:
+            return
+        path = self.nfh_path.get().strip()
+        if os.path.isdir(path):
+            self._fill_box(self.nfh_box, self.nfh_path, path, ("*.xlsx", "*.xlsm"))
+            path = self.nfh_path.get().strip()
+        if not os.path.isfile(path):
+            tkMessageBox.showwarning(APP_TITLE, "Pick the offsets workbook first.")
+            return
+        try:
+            extra = abs(float(self.nfh_tolerance.get()))
+        except ValueError:
+            extra = 0.0
+            self.nfh_tolerance.set("0.000")
+
+        self.status.set("Reading NFH positions...")
+        self.update_idletasks()
+        try:
+            entries, sheet_name, notes = read_nfh_sheet(path)
+        except (XlsxError, IOError) as exc:
+            tkMessageBox.showerror(APP_TITLE, "Offsets workbook:\n%s" % exc)
+            self.status.set("NFH positions could not be read.")
+            return
+        if not self.ccs.nfh:
+            tkMessageBox.showwarning(
+                APP_TITLE, "This CCS printout has no Near Field Hydrophone "
+                           "table, so there is nothing to cross check against.")
+            self.status.set("No NFH table in the CCS printout.")
+            return
+
+        self.nfh_sheet_name = sheet_name
+        self.nfh_rows, self.nfh_stats, self.nfh_notes = compare_nfh(
+            entries, self.ccs, extra)
+        self.nfh_notes = list(notes) + list(self.nfh_notes)
+
+        for iid in self.nfh_tree.get_children():
+            self.nfh_tree.delete(iid)
+        for row in self.nfh_rows:
+            conn = row["block"] or (u"NFH %s" % row["connector"])
+            self.nfh_tree.insert("", "end", tags=(row["tag"],), values=(
+                conn, row["sub"], row["pos"], row["device"],
+                row["across_sheet"], row["across_ccs"], row["across_diff"],
+                row["along_sheet"], row["along_ccs"], row["along_diff"],
+                row["above_sheet"], row["above_ccs"], row["above_diff"],
+                row["status"], row["note"]))
+
+        s = self.nfh_stats
+        parts = ["%d NFH cross checked" % s["checked"]]
+        parts.append("%d match" % s["ok"] if not s["bad"]
+                     else "%d match, %d MISMATCH" % (s["ok"], s["bad"]))
+        if s["sheet_only"]:
+            parts.append("%d on the sheet not configured in this CCS" % s["sheet_only"])
+        if s["ccs_only"]:
+            parts.append("%d in CCS with no sheet row" % s["ccs_only"])
+        self.status.set("  |  ".join(parts))
+        self.nfh_title.config(
+            text="NFH offsets - '%s' vs CCS   [%s]"
+                 % (sheet_name, "; ".join(self.nfh_notes)))
+        self._save_state()
+
+    def export_nfh(self):
+        if not self.nfh_rows:
+            tkMessageBox.showinfo(APP_TITLE, "Run the NFH cross check first.")
+            return
+        path = tkFileDialog.asksaveasfilename(
+            title="Export NFH cross check",
+            defaultextension=".csv",
+            initialfile="nfh_vs_ccs_%s.csv" % time.strftime("%Y%m%d_%H%M"),
+            filetypes=[("CSV", "*.csv"), ("HTML report", "*.html")])
+        if not path:
+            return
+        try:
+            if path.lower().endswith((".html", ".htm")):
+                self._export_nfh_html(path)
+            else:
+                with open(path, "wb") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(
+                        ["NFH", "Sub array", "Position", "CCS device",
+                         "Across sheet", "Across CCS", "d Across",
+                         "Along sheet", "Along CCS", "d Along",
+                         "Above sheet", "Above CCS", "d Above",
+                         "Status", "Note"])
+                    for r in self.nfh_rows:
+                        writer.writerow([
+                            to_text(r["block"]).encode("utf-8"), r["sub"], r["pos"],
+                            to_text(r["device"]).encode("utf-8"),
+                            r["across_sheet"], r["across_ccs"], r["across_diff"],
+                            r["along_sheet"], r["along_ccs"], r["along_diff"],
+                            r["above_sheet"], r["above_ccs"], r["above_diff"],
+                            r["status"], to_text(r["note"]).encode("utf-8")])
+        except IOError as exc:
+            tkMessageBox.showerror(APP_TITLE, "Could not write:\n%s" % exc)
+            return
+        self.status.set("Exported to %s" % path)
+
+    def _export_nfh_html(self, path):
+        def esc(v):
+            return (to_text(v).replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;"))
+        s = self.nfh_stats
+        out = [u"<!DOCTYPE html><html><head><meta charset='utf-8'>",
+               u"<title>NFH offsets vs CCS</title><style>",
+               u"body{font-family:Arial,Helvetica,sans-serif;font-size:12px;"
+               u"margin:18px;background:#fff;color:#000}"
+               u"h1{font-size:18px;color:%s;margin:0 0 4px}"
+               u"table{border-collapse:collapse;width:100%%;margin-top:8px}"
+               u"th{background:%s;border:1px solid #7d95ad;padding:4px 7px;"
+               u"text-align:left;font-size:11px}"
+               u"td{border:1px solid #cfd8e3;padding:3px 7px;"
+               u"font-variant-numeric:tabular-nums}"
+               u".num{text-align:right}.ok{background:%s}.bad{background:%s}"
+               u".skip{background:%s;color:#5a6570}.meta{color:#41505e}"
+               % (HEADER_TEXT, BTN, ROW_OK, ROW_BAD, ROW_SKIP),
+               u"</style></head><body>",
+               u"<h1>NFH position cross check</h1>",
+               u"<p class='meta'>CCS printout: %s<br>Offsets workbook: %s (sheet "
+               u"'%s')<br>Checked: %s<br><b>%d of %d match</b></p>"
+               % (esc(self.ccs_path.get()), esc(self.nfh_path.get()),
+                  esc(self.nfh_sheet_name), time.strftime("%Y-%m-%d %H:%M:%S"),
+                  s["ok"], s["checked"]),
+               u"<p class='meta'>%s</p>" % esc("; ".join(self.nfh_notes)),
+               u"<table><tr><th>NFH</th><th>Sub array</th><th>Position</th>"
+               u"<th>CCS device</th><th>Across sheet</th><th>Across CCS</th>"
+               u"<th>d Across</th><th>Along sheet</th><th>Along CCS</th>"
+               u"<th>d Along</th><th>Above sheet</th><th>Above CCS</th>"
+               u"<th>d Above</th><th>Status</th><th>Note</th></tr>"]
+        for r in self.nfh_rows:
+            out.append(
+                u"<tr class='%s'><td>%s</td><td class='num'>%s</td>"
+                u"<td class='num'>%s</td><td>%s</td>"
+                u"<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
+                u"<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
+                u"<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
+                u"<td><b>%s</b></td><td>%s</td></tr>"
+                % (r["tag"], esc(r["block"]), r["sub"], r["pos"], esc(r["device"]),
+                   r["across_sheet"], r["across_ccs"], r["across_diff"],
+                   r["along_sheet"], r["along_ccs"], r["along_diff"],
+                   r["above_sheet"], r["above_ccs"], r["above_diff"],
+                   esc(r["status"]), esc(r["note"])))
+        out.append(u"</table></body></html>")
+        with open(path, "wb") as fh:
+            fh.write(u"\n".join(out).encode("utf-8"))
 
     def _fill_summary(self, problems=None):
         for iid in self.summary.get_children():
@@ -1807,7 +2431,8 @@ class StreamerQCPanel(tk.Frame):
 
     def _restore_paths(self):
         state = getattr(self, "_state", {}) or {}
-        for key, var in (("ccs", self.ccs_path), ("sheet", self.sheet_path)):
+        for key, var in (("ccs", self.ccs_path), ("sheet", self.sheet_path),
+                         ("nfh", self.nfh_path)):
             value = state.get(key)
             if isinstance(value, basestring) and os.path.exists(value):
                 var.set(value)
@@ -1825,6 +2450,7 @@ class StreamerQCPanel(tk.Frame):
         state = {
             "ccs": self.ccs_path.get(),
             "sheet": self.sheet_path.get(),
+            "nfh": self.nfh_path.get(),
             "tolerance": tol,
             "start_leadin": bool(self.start_leadin.get()),
             "aliases": self.aliases,
