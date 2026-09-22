@@ -18,7 +18,13 @@
 # --- Source / dither UI (current) ---
 # - Parameters: Shotpoint Check; Line name + Production Shotpoints; Anchored Shot; Line Direction (read-only, lineque); Source to Fire at Anchor; Refresh.
 # - Shot log: tail -20 shotcontroller.log (or direct file read if tail fails). Line format: [date time] - [shotpoint] - [LEVEL] - message (shotpoint may be negative, e.g. 2364 or -10255). Parse NEW SHOT : SP then Source to fire ... src N; else Aimpoint dither lines (for shot supports signed SP).
-# - Three sources; one "Dither File to Use" per source. Expected source: (SP - SOURCE_CYCLE_ANCHOR_SP) % 3 + direction rule.
+# - Gun Firing Sequence source: Manual (up/down comma lists + anchor SP) or Preplot (P1/11).
+#   Manual default 1,2,3 / 3,2,1 from SP 1001 reproduces the original hardcoded 3-source rule.
+#   Preplot reads Source_Shooting_Sequence_Offset (cycles), Reference_Shot_Number (anchor),
+#   Source_Shooting_Sequence_Length (wrap) and Source_Shooting_Constraints_Definition
+#   jitteringAtIndex (dither), so source count and cycles follow the job rather than the code.
+#   Index: upline (SP - ref) mod L, downline (ref - SP) mod L.
+# - One "Dither File to Use" per source, used unless the preplot supplies the dither.
 # - [General] dither_pattern_reference: Anchored SP | Production FSP | Adaptive. Row index: anchor or Prod FSP; Adaptive aligns file phase from last 3 shots' Trinav dither vs pattern. Upline: offset = SP-ref; downline: ref-SP; pattern[idx % L] with wrap.
 
 import Tkinter as tk
@@ -32,6 +38,9 @@ import os
 import re
 from collections import OrderedDict
 import sys
+import threading
+import traceback
+import signal
 
 # --- Check Python Version ---
 if sys.version_info[0] != 2 or sys.version_info[1] != 7:
@@ -42,13 +51,299 @@ if sys.version_info[0] != 2 or sys.version_info[1] != 7:
 SOURCE_CYCLE_ANCHOR_SP = 1001
 SOURCE_CYCLE_COUNT = 3
 
+# --- Gun firing sequence source ---
+# Manual: cycles typed below (defaults reproduce the long-standing rule).
+# Preplot: cycles, anchor, wrap length and dither all read from a P1/11 preplot.
+SEQ_SOURCE_MANUAL = "Manual (sequence below)"
+SEQ_SOURCE_PREPLOT = "Preplot (P1/11)"
+SEQ_SOURCE_CHOICES = (SEQ_SOURCE_MANUAL, SEQ_SOURCE_PREPLOT)
+DEFAULT_UP_SEQUENCE = "1,2,3"
+DEFAULT_DOWN_SEQUENCE = "3,2,1"
+
 PATTERN_REF_ANCHORED_SP = "Anchored SP"
 PATTERN_REF_PRODUCTION_FSP = "Production FSP"
 PATTERN_REF_ADAPTIVE = "Adaptive"
 PATTERN_REF_CHOICES = (PATTERN_REF_ANCHORED_SP, PATTERN_REF_PRODUCTION_FSP, PATTERN_REF_ADAPTIVE)
+# Not offered in the menu: selected implicitly whenever the gun sequence source is the preplot.
+PATTERN_REF_PREPLOT = "Preplot"
+
+
+# Long-run guards. The tool is left running for days: bound the log widget, never let one
+# hung system command freeze the GUI, and never let one exception end the timer loop.
+LOG_MAX_LINES = 4000          # trim the check log back to LOG_KEEP_LINES once it passes this
+LOG_KEEP_LINES = 3000
+COMMAND_TIMEOUT_S = 20        # ex_lineque / tail: kill and retry next cycle if slower than this
 
 # Adaptive: after this many consecutive dither MISMATCHes while locked, clear alignment and re-search the file/log.
 ADAPTIVE_MISMATCH_STREAK_TO_RESET = 3
+
+def parse_preplot(filepath):
+    """Read the shooting sequence and dither (jitter) out of a P1/11 design preplot.
+
+    Returns (data, status). data is None on failure and status says why.
+
+    data keys:
+      ref_shot       survey-wide Reference_Shot_Number anchoring every sequence
+      seq_len        sequence wrap length in shotpoints
+      patterns       {pattern_id: {'seq': [source per index], 'dither': [secs per index] or None}}
+      line_patterns  {line_name: (incremental_id, decremental_id)} from the N1 line records
+      line_ranges    {line_name: (first_sp, last_sp)}
+      default_pair   (incremental_id, decremental_id) used when a line is not listed
+      inc_seq/dec_seq/dither/pat_inc/pat_dec  convenience views of default_pair
+      sources        sorted source numbers used by default_pair
+      num_srcs       len(sources) - 2, 3, ... never assumed
+
+    Index convention (verified against acquired P1/11 postplot data, 173/173 shots):
+      upline   idx = (SP - ref_shot) mod seq_len
+      downline idx = (ref_shot - SP) mod seq_len
+    """
+    if not filepath or not os.path.exists(filepath):
+        return None, "Preplot not found: {}".format(filepath)
+
+    seq = {}            # pid -> {idx: source}
+    jit = {}            # pid -> {idx: seconds}
+    refs = {}           # pid -> reference shot
+    line_patterns = {}  # line name -> (inc, dec)
+    line_ranges = {}    # line name -> (fsp, lsp)
+    pair_order = []     # distinct pairs in file order
+    inc_first = True
+    last_line_name = None
+    pair_re = re.compile(r'^\s*(\d+)\s*;\s*(\d+)\s*$')
+    try:
+        fh = open(filepath, 'r')
+    except IOError as e:
+        return None, "Cannot open preplot: {}".format(e)
+    try:
+        for line in fh:
+            if line.startswith('H1,4,0,0'):
+                low = line.lower()
+                i_inc = low.find('incremental')
+                i_dec = low.find('decremental')
+                if i_inc >= 0 and i_dec >= 0:
+                    inc_first = i_inc < i_dec
+                continue
+            if line.startswith('N1,0,'):
+                p = line.rstrip('\r\n').split(',')
+                if len(p) >= 7:
+                    last_line_name = p[4].strip()
+                    try:
+                        line_ranges[last_line_name] = (int(p[5]), int(p[6]))
+                    except ValueError:
+                        pass
+                continue
+            if line.startswith('N1,2,'):
+                p = line.rstrip('\r\n').split(',')
+                pair = None
+                for fld in reversed(p):
+                    m = pair_re.match(fld)
+                    if m:
+                        a, b = int(m.group(1)), int(m.group(2))
+                        pair = (a, b) if inc_first else (b, a)
+                        break
+                if pair is not None:
+                    if pair not in pair_order:
+                        pair_order.append(pair)
+                    if last_line_name:
+                        line_patterns[last_line_name] = pair
+                continue
+            if not line.startswith('HC,2,3,1,'):
+                continue
+            p = line.rstrip('\r\n').split(',')
+            if len(p) < 8:
+                continue
+            label = p[4].strip()
+            try:
+                pid = int(p[5])
+            except ValueError:
+                continue
+            val = p[7]
+            if label == 'Source_Shooting_Sequence_Offset':
+                f = val.split('|')
+                if len(f) >= 2:
+                    try:
+                        seq.setdefault(pid, {})[int(f[0])] = int(f[1])
+                    except ValueError:
+                        pass
+            elif label == 'Source_Shooting_Constraints_Definition':
+                f = val.split('|')
+                if len(f) >= 4 and f[1].strip().lower() == 'jitteringatindex':
+                    try:
+                        jit.setdefault(pid, {})[int(f[3])] = float(f[2])
+                    except ValueError:
+                        pass
+            elif label == 'Reference_Shot_Number':
+                try:
+                    refs[pid] = int(val)
+                except ValueError:
+                    pass
+    except IOError as e:
+        return None, "Error reading preplot: {}".format(e)
+    finally:
+        try:
+            fh.close()
+        except IOError:
+            pass
+
+    if not seq:
+        return None, "No Source_Shooting_Sequence_Offset records found (not a design preplot?)"
+
+    def _to_list(store, pid):
+        idxs = store.get(pid, {})
+        if not idxs:
+            return None
+        count = max(idxs) + 1
+        if len(idxs) != count or min(idxs) != 0:
+            return None
+        return [idxs[i] for i in range(count)]
+
+    patterns = {}
+    for pid in sorted(seq.keys()):
+        sq = _to_list(seq, pid)
+        if sq is None:
+            return None, "Shooting pattern {}: sequence indices not contiguous from 0".format(pid)
+        dt = _to_list(jit, pid) if pid in jit else None
+        if pid in jit and dt is None:
+            return None, "Shooting pattern {}: dither indices not contiguous from 0".format(pid)
+        patterns[pid] = {'seq': sq, 'dither': dt}
+
+    if pair_order:
+        default_pair = pair_order[0]
+    else:
+        ids = sorted(patterns.keys())
+        if len(ids) < 2:
+            return None, "Only one shooting pattern in preplot; cannot tell upline from downline"
+        default_pair = (ids[0], ids[1])
+
+    used = set([default_pair[0], default_pair[1]])
+    for pr in line_patterns.values():
+        used.update(pr)
+    for pid in sorted(used):
+        if pid not in patterns:
+            return None, "Line records reference shooting pattern {} which has no sequence".format(pid)
+
+    lens = set(len(patterns[pid]['seq']) for pid in used)
+    if len(lens) != 1:
+        return None, "Shooting patterns differ in sequence length: {}".format(sorted(lens))
+    seq_len = lens.pop()
+
+    ref_vals = set(refs[pid] for pid in used if pid in refs)
+    if not ref_vals:
+        return None, "No Reference_Shot_Number in preplot"
+    if len(ref_vals) != 1:
+        return None, "Shooting patterns carry different Reference_Shot_Number: {}".format(sorted(ref_vals))
+    ref = ref_vals.pop()
+
+    pat_inc, pat_dec = default_pair
+    inc_seq = patterns[pat_inc]['seq']
+    dec_seq = patterns[pat_dec]['seq']
+    dither = patterns[pat_inc]['dither'] or patterns[pat_dec]['dither']
+    sources = sorted(set(inc_seq) | set(dec_seq))
+    return {
+        'path': filepath,
+        'ref_shot': ref,
+        'seq_len': seq_len,
+        'patterns': patterns,
+        'line_patterns': line_patterns,
+        'line_ranges': line_ranges,
+        'default_pair': default_pair,
+        'inc_seq': inc_seq,
+        'dec_seq': dec_seq,
+        'dither': dither,
+        'pat_inc': pat_inc,
+        'pat_dec': pat_dec,
+        'sources': sources,
+        'num_srcs': len(sources),
+        'multi_pattern': len(pair_order) > 1,
+    }, "OK"
+
+
+def parse_postplot_p111(filepath):
+    """Read acquired shots out of a Trinav P1/11 postplot.
+
+    Returns (groups, status). groups is a list, one per (sequence, line) in file order:
+      {'sequence', 'line', 'is_upline', 'shots': [(sp, source_number, dither_secs, time_str)]}
+    Shots are in time order. The dither column is located from the H1,1,0,0 record type
+    definitions ('Aimpoint Dither' attribute) rather than assumed, so a differently
+    configured export still parses or is rejected with a reason.
+    """
+    if not filepath or not os.path.exists(filepath):
+        return None, "Postplot not found: {}".format(filepath)
+    try:
+        fh = open(filepath, 'r')
+    except IOError as e:
+        return None, "Cannot open postplot: {}".format(e)
+    try:
+        head = fh.readline()
+        if head.startswith('H00') or head.startswith('H0'):
+            return None, ("P1/90 postplot detected. P1/90 has no 'Aimpoint Dither' attribute field; "
+                          "only P1/11 exports carry the applied dither. Use the P1/11 output of this sequence.")
+        if not head.startswith('OGP,') and not head.startswith('OGP '):
+            return None, "Not a P1/11 file (no OGP header line)"
+        fh.seek(0)
+        type_attrs = {}     # record type -> (attr_count, dither_attr_index or None)
+        groups = OrderedDict()
+        src_digits = re.compile(r'(\d+)\s*$')
+        n_s1 = 0
+        for line in fh:
+            if line.startswith('H1,1,0,0'):
+                p = line.rstrip('\r\n').split(',')
+                if len(p) < 12:
+                    continue
+                try:
+                    rtype = int(p[5]); count = int(p[11])
+                except ValueError:
+                    continue
+                dith_idx = None
+                for i, d in enumerate(p[12:12 + count]):
+                    if 'aimpoint dither' in d.lower():
+                        dith_idx = i
+                type_attrs[rtype] = (count, dith_idx)
+                continue
+            if not line.startswith('S1,'):
+                continue
+            n_s1 += 1
+            p = line.rstrip('\r\n').split(',')
+            if len(p) < 12:
+                continue
+            seq_id, line_name = p[2].strip(), p[3].strip()
+            try:
+                sp = int(p[4]); rtype = int(p[10])
+            except ValueError:
+                continue
+            m = src_digits.search(p[9].strip())
+            if not m:
+                return None, "Cannot read source number from object name '{}' at SP {}".format(p[9], sp)
+            src = int(m.group(1))
+            count, dith_idx = type_attrs.get(rtype, (0, None))
+            dither = None
+            if dith_idx is not None and count > 0 and len(p) >= count:
+                try:
+                    dither = float(p[len(p) - count + dith_idx])
+                except ValueError:
+                    dither = None
+            key = (seq_id, line_name)
+            if key not in groups:
+                groups[key] = {'sequence': seq_id, 'line': line_name, 'shots': []}
+            groups[key]['shots'].append((sp, src, dither, p[7].strip()))
+    except IOError as e:
+        return None, "Error reading postplot: {}".format(e)
+    finally:
+        try:
+            fh.close()
+        except IOError:
+            pass
+    if n_s1 == 0:
+        return None, "No S1 shot records in file (is this a design preplot rather than a postplot?)"
+    out = []
+    for g in groups.values():
+        shots = g['shots']
+        if len(shots) >= 2:
+            g['is_upline'] = shots[-1][0] > shots[0][0]
+        else:
+            g['is_upline'] = None
+        out.append(g)
+    return out, "OK"
+
 
 # --- Main Application Class ---
 class xSourceDitherQCApp:
@@ -70,13 +365,15 @@ class xSourceDitherQCApp:
 
 
         # --- Defaults ---
-        self.default_config_dir = '/usr/local/trinop/dbase/links/qcfiles/Misc/xDitherQC/'
-        self.default_config_name = 'xDitherQC.xcfg';
+        self.default_config_dir = '/usr/local/trinop/qcfiles/Misc/xSourceDitherQC/'
+        self.default_config_name = 'xSourceDitherQC.xcfg'
         self.config_full_path = os.path.join(self.default_config_dir, self.default_config_name)
+        self._ensure_default_config_dir()
         self.log_file_path = '/usr/local/trinop/naverror/shotcontroller.log'
         self.lineque_cmd = 'ex_lineque -print'
         self.log_tail_cmd = 'tail -20 {}'.format(self.log_file_path)
         self.float_tolerance = 0.001; self.default_retry_interval_ms = 5000; self.loop_buffer_ms = 500; self.default_dither_dir = '/usr/local/trinop/dbase/links/qcfiles/Dither'
+        self.default_preplot_dir = '/usr/local/trinop/qcfiles'
 
         # --- State ---
         self.config_name_var = tk.StringVar(value=self.default_config_name)
@@ -97,6 +394,24 @@ class xSourceDitherQCApp:
         self.display_prod_shotpoints_var = tk.StringVar(value="—")
         self.dither_pattern_reference_var = tk.StringVar(value=PATTERN_REF_ANCHORED_SP)
         self.gun_sequence_only_var = tk.IntVar(value=0)
+        self.seq_source_var = tk.StringVar(value=SEQ_SOURCE_MANUAL)
+        self.preplot_path_var = tk.StringVar(value="")
+        self.up_sequence_var = tk.StringVar(value=DEFAULT_UP_SEQUENCE)
+        self.down_sequence_var = tk.StringVar(value=DEFAULT_DOWN_SEQUENCE)
+        self.seq_anchor_var = tk.StringVar(value=str(SOURCE_CYCLE_ANCHOR_SP))
+        self.postplot_path_var = tk.StringVar(value="")
+        self._postplot_frame = None
+        self._preplot = None
+        self._preplot_crosscheck_key = None
+        self._preplot_status_label = None
+        self._preplot_widgets = []
+        self._manual_seq_widgets = []
+        self._pat_row = None
+        self._gun_row = None
+        self._seq_src_row = None
+        self._preplot_row = None
+        self._manual_row = None
+        self._sources_sep = None
         self.params_frame = None
         self._adaptive_triple_start_row = {1: None, 2: None, 3: None}
         self._adaptive_sp_base = None
@@ -109,6 +424,19 @@ class xSourceDitherQCApp:
         self.setup_gui()
         self.load_config() # Initial load on startup
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _ensure_default_config_dir(self):
+        """Create the default config directory up front so Save and Browse always have a home."""
+        d = self.default_config_dir
+        if os.path.isdir(d):
+            return True
+        try:
+            os.makedirs(d)
+            print "Created default config directory: {}".format(d)
+            return True
+        except OSError as e:
+            print "Warning: could not create default config directory {}: {}".format(d, e)
+            return False
 
     def setup_gui(self):
         self.root.configure(bg=self.color_blue_aura_bg)
@@ -150,9 +478,26 @@ class xSourceDitherQCApp:
         tk.Button(config_btn_frame, text="Save", command=self.save_config,
                   bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg).pack(side=tk.LEFT)
 
+        # Pack order is Tk's allocation priority when the window is too short. Buttons go
+        # first (never squeezed), then the parameters, and the log last (shrinks first).
+        btn_frame = tk.Frame(self.root, bg=self.color_blue_aura_bg)
+        btn_frame.pack(side=tk.BOTTOM, pady=5)
+        self.start_button = tk.Button(btn_frame, text="Start Source/Dither Check", command=self.start_checking, width=26,
+                                      bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg)
+        self.start_button.pack(side=tk.LEFT, padx=10)
+        self.stop_button = tk.Button(btn_frame, text="Stop Source/Dither Check", command=self.stop_checking, state=tk.DISABLED, width=26,
+                                     bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg,
+                                     disabledforeground=self.color_disabled_fg)
+        self.stop_button.pack(side=tk.LEFT, padx=10)
+        # Status line lives with the buttons (priority over the parameters), not in the log frame.
+        self.status_label_text = tk.StringVar(value="Idle")
+        self.status_label = tk.Label(self.root, textvariable=self.status_label_text, font=self.status_font, anchor='w',
+                                     bg=self.color_blue_aura_bg)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=2); self.status_label.config(fg="gray")
+
         self.params_frame = tk.LabelFrame(self.root, text="Source and Dither Parameters",
                                           bg=self.color_blue_aura_bg, fg=self.color_label_frame_fg, font=self.heading_font)
-        self.params_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.params_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
         live_frame = tk.Frame(self.params_frame, bg=self.color_blue_aura_bg)
         live_frame.pack(fill=tk.X, padx=8, pady=4)
@@ -189,6 +534,7 @@ class xSourceDitherQCApp:
         align_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
         pat_row = tk.Frame(align_frame, bg=self.color_blue_aura_bg)
         pat_row.pack(fill=tk.X, pady=(2, 6))
+        self._pat_row = pat_row
         tk.Label(pat_row, text="Dither Pattern Reference", bg=self.color_blue_aura_bg, fg=self.color_text_dark,
                  font=self.results_font, anchor='w').pack(side=tk.LEFT)
         self._dither_pattern_ref_menu = tk.OptionMenu(
@@ -207,6 +553,7 @@ class xSourceDitherQCApp:
 
         gun_row = tk.Frame(align_frame, bg=self.color_blue_aura_bg)
         gun_row.pack(fill=tk.X, pady=(0, 2))
+        self._gun_row = gun_row
         tk.Label(gun_row, text="Source Sequence Check Only(Disable Dither QC)", bg=self.color_blue_aura_bg, fg=self.color_text_dark,
                  font=self.results_font, anchor='w').pack(side=tk.LEFT)
         tk.Checkbutton(
@@ -216,20 +563,109 @@ class xSourceDitherQCApp:
             selectcolor=self.color_entry_bg, anchor='w',
             font=self.results_font).pack(side=tk.LEFT, padx=(10, 0))
 
-        tk.Frame(self.params_frame, height=2, bd=1, relief=tk.SUNKEN, bg=self.color_blue_aura_bg).pack(fill=tk.X, pady=5)
+        seq_frame = tk.LabelFrame(self.params_frame, text="Gun Firing Sequence",
+                                  bg=self.color_blue_aura_bg, fg=self.color_label_frame_fg, font=self.results_font)
+        seq_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        seq_src_row = tk.Frame(seq_frame, bg=self.color_blue_aura_bg)
+        seq_src_row.pack(fill=tk.X, padx=5, pady=(3, 2))
+        self._seq_src_row = seq_src_row
+        tk.Label(seq_src_row, text="Sequence Source:", width=18, anchor='w',
+                 bg=self.color_blue_aura_bg, fg=self.color_text_dark, font=self.results_font).pack(side=tk.LEFT)
+        self._seq_source_menu = tk.OptionMenu(seq_src_row, self.seq_source_var, *SEQ_SOURCE_CHOICES)
+        self._seq_source_menu.config(
+            bg=self.color_button_bg, fg=self.color_text_dark,
+            activebackground=self.color_button_active_bg, activeforeground=self.color_text_dark,
+            highlightthickness=0, bd=1, relief=tk.RAISED)
+        self._seq_source_menu['menu'].config(
+            bg=self.color_button_bg, fg=self.color_text_dark,
+            activebackground=self.color_button_active_bg, activeforeground=self.color_text_dark,
+            bd=1, relief=tk.FLAT)
+        self._seq_source_menu.pack(side=tk.LEFT, padx=(10, 0))
+        self.seq_source_var.trace('w', lambda *args: self._on_seq_source_changed())
+        self.up_sequence_var.trace('w', lambda *args: self._rebuild_source_rows_if_changed())
+        self.down_sequence_var.trace('w', lambda *args: self._rebuild_source_rows_if_changed())
+
+        preplot_row = tk.Frame(seq_frame, bg=self.color_blue_aura_bg)
+        preplot_row.pack(fill=tk.X, padx=5, pady=2)
+        self._preplot_row = preplot_row
+        tk.Label(preplot_row, text="Preplot File:", width=18, anchor='w',
+                 bg=self.color_blue_aura_bg, fg=self.color_text_dark).pack(side=tk.LEFT)
+        self._preplot_entry = tk.Entry(preplot_row, textvariable=self.preplot_path_var,
+                                       bg=self.color_entry_bg, fg=self.color_text_dark,
+                                       insertbackground=self.color_text_dark,
+                                       disabledbackground=self.color_disabled_bg,
+                                       disabledforeground=self.color_disabled_fg)
+        self._preplot_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        self._preplot_entry.bind('<Return>', lambda e: self._ensure_preplot_current())
+        self._preplot_entry.bind('<FocusOut>', lambda e: self._ensure_preplot_current())
+        self._preplot_browse_btn = tk.Button(preplot_row, text="Browse...", command=self.browse_preplot_file,
+                                             bg=self.color_button_bg, fg=self.color_text_dark,
+                                             activebackground=self.color_button_active_bg,
+                                             disabledforeground=self.color_disabled_fg)
+        self._preplot_browse_btn.pack(side=tk.LEFT)
+        self._preplot_status_label = tk.Label(preplot_row, text="Not Loaded", fg="gray", width=10,
+                                              font=self.small_font, bg=self.color_blue_aura_bg)
+        self._preplot_status_label.pack(side=tk.LEFT, padx=5)
+        self._preplot_widgets = [self._preplot_entry, self._preplot_browse_btn]
+
+        manual_row = tk.Frame(seq_frame, bg=self.color_blue_aura_bg)
+        manual_row.pack(fill=tk.X, padx=5, pady=(2, 5))
+        self._manual_row = manual_row
+        tk.Label(manual_row, text="Manual Sequence:", width=18, anchor='w',
+                 bg=self.color_blue_aura_bg, fg=self.color_text_dark).pack(side=tk.LEFT)
+        self._manual_seq_widgets = []
+        for _cap, _var, _w in (("Up", self.up_sequence_var, 12),
+                               ("Down", self.down_sequence_var, 12),
+                               ("Anchor SP", self.seq_anchor_var, 9)):
+            tk.Label(manual_row, text=_cap, bg=self.color_blue_aura_bg, fg=self.color_text_dark,
+                     font=self.small_font).pack(side=tk.LEFT, padx=(6, 2))
+            _e = tk.Entry(manual_row, textvariable=_var, width=_w,
+                          bg=self.color_entry_bg, fg=self.color_text_dark,
+                          insertbackground=self.color_text_dark,
+                          disabledbackground=self.color_disabled_bg,
+                          disabledforeground=self.color_disabled_fg)
+            _e.pack(side=tk.LEFT)
+            self._manual_seq_widgets.append(_e)
+        tk.Label(manual_row, text="(comma list, e.g. 1,2 for two sources)",
+                 bg=self.color_blue_aura_bg, fg=self.color_text_dark,
+                 font=self.small_font).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._sources_sep = tk.Frame(self.params_frame, height=2, bd=1, relief=tk.SUNKEN, bg=self.color_blue_aura_bg)
+        self._sources_sep.pack(fill=tk.X, pady=5)
         self.sources_area = tk.Frame(self.params_frame, bg=self.color_blue_aura_bg)
         self.sources_area.pack(fill=tk.X, pady=(5, 0))
 
         self._build_ui_elements()
 
+        self._postplot_frame = tk.LabelFrame(
+            self.params_frame, text="Postplot Dither QC (offline - live check must be stopped)",
+            bg=self.color_blue_aura_bg, fg=self.color_label_frame_fg, font=self.results_font)
+        self._postplot_frame.pack(fill=tk.X, padx=8, pady=(8, 4))
+        pq_row = tk.Frame(self._postplot_frame, bg=self.color_blue_aura_bg)
+        pq_row.pack(fill=tk.X, padx=5, pady=(3, 5))
+        tk.Label(pq_row, text="P1/11 Postplot:", width=18, anchor='w',
+                 bg=self.color_blue_aura_bg, fg=self.color_text_dark).pack(side=tk.LEFT)
+        tk.Entry(pq_row, textvariable=self.postplot_path_var,
+                 bg=self.color_entry_bg, fg=self.color_text_dark,
+                 insertbackground=self.color_text_dark).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        tk.Button(pq_row, text="Browse...", command=self.browse_postplot_file,
+                  bg=self.color_button_bg, fg=self.color_text_dark,
+                  activebackground=self.color_button_active_bg).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(pq_row, text="QC Dither", command=self.run_postplot_qc, width=12,
+                  bg=self.color_button_bg, fg=self.color_text_dark,
+                  activebackground=self.color_button_active_bg,
+                  font=self.heading_font).pack(side=tk.LEFT)
+
         rt_frame = tk.LabelFrame(self.root, text="Near Real Time Source Sequence and Dither Check",
                                  bg=self.color_blue_aura_bg, fg=self.color_label_frame_fg, font=self.heading_font)
-        rt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        rt_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self._rt_frame = rt_frame
 
         self.log_text = ScrolledText.ScrolledText(rt_frame, wrap=tk.WORD, height=15, state=tk.DISABLED,
                                                   font=self.results_font, bg=self.color_log_bg, fg=self.color_text_dark,
                                                   insertbackground=self.color_text_dark)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0,5))
+        self.log_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=(0,5))
         self.log_text.tag_configure("ok", foreground="green")
         self.log_text.tag_configure("error", foreground="red")
         self.log_text.tag_configure("warning", foreground="orange")
@@ -238,21 +674,6 @@ class xSourceDitherQCApp:
         self.log_text.tag_configure("heading", font=self.heading_font)
         self.log_text.tag_configure("separator", foreground="gray")
 
-        self.status_label_text = tk.StringVar(value="Idle")
-        self.status_label = tk.Label(rt_frame, textvariable=self.status_label_text, font=self.status_font, anchor='w',
-                                     bg=self.color_blue_aura_bg)
-        self.status_label.pack(fill=tk.X, padx=5, pady=2); self.status_label.config(fg="gray")
-
-        btn_frame = tk.Frame(self.root, bg=self.color_blue_aura_bg)
-        btn_frame.pack(pady=5)
-        self.start_button = tk.Button(btn_frame, text="Start Source/Dither Check", command=self.start_checking, width=26,
-                                      bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg)
-        self.start_button.pack(side=tk.LEFT, padx=10)
-        self.stop_button = tk.Button(btn_frame, text="Stop Source/Dither Check", command=self.stop_checking, state=tk.DISABLED, width=26,
-                                     bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg,
-                                     disabledforeground=self.color_disabled_fg)
-        self.stop_button.pack(side=tk.LEFT, padx=10)
-
     def _info_help_text(self):
         a = SOURCE_CYCLE_ANCHOR_SP
         return (
@@ -260,12 +681,25 @@ class xSourceDitherQCApp:
             "===========================\n"
             "The app reads the latest shot from shotcontroller.log (NEW SHOT / Source to fire) and compares it to the\n"
             "expected source for that shotpoint.\n\n"
-            "Line direction comes from the line queue (ex_lineque): Upline or Downline.\n"
-            "The tool assumes exactly three sources in the shot cycle.\n\n"
-            "Calculation:\n"
-            "  index = (shotpoint - {a}) mod 3\n"
-            "  Upline:  index 0 -> Source 1,  1 -> Source 2,  2 -> Source 3\n"
-            "  Downline: index 0 -> Source 3, 1 -> Source 2, 2 -> Source 1\n\n"
+            "Line direction comes from the line queue (ex_lineque): Upline or Downline.\n\n"
+            "Gun Firing Sequence -> Sequence Source picks where the cycle comes from.\n\n"
+            "Manual (sequence below)\n"
+            "  Up and Down are comma lists of source numbers; Anchor SP fixes the phase.\n"
+            "  index = (shotpoint - Anchor SP) mod (number of entries in the list)\n"
+            "  expected source = list[index]\n"
+            "  Defaults Up 1,2,3 / Down 3,2,1 / Anchor {a} are the original three-source rule.\n"
+            "  Two sources is just Up 1,2 and Down 2,1 - nothing else needs changing.\n\n"
+            "Preplot (P1/11)\n"
+            "  Cycles, anchor, cycle length and dither are all read from the design preplot,\n"
+            "  so source count and firing order follow the job instead of being typed in.\n"
+            "  Read from: Source_Shooting_Sequence_Offset (cycle per direction),\n"
+            "  Reference_Shot_Number (anchor), Source_Shooting_Sequence_Length (wrap),\n"
+            "  Source_Shooting_Constraints_Definition / jitteringAtIndex (dither seconds).\n"
+            "  index = (shotpoint - reference) mod length upline,\n"
+            "          (reference - shotpoint) mod length downline.\n"
+            "  While this is selected the per-source dither files and the Dither Pattern\n"
+            "  Reference row are hidden - the preplot supplies both. Switch back to\n"
+            "  Manual to bring them back; nothing typed into them is lost.\n\n"
             "PASS when the source in the log matches this expected source.\n\n"
             "DITHER CHECK (by Dither Pattern Reference mode)\n"
             "=================================================\n"
@@ -372,15 +806,14 @@ class xSourceDitherQCApp:
             widget.destroy()
         self.source_configs.clear()
 
-        self.num_sources.set(SOURCE_CYCLE_COUNT)
-        n_sources = SOURCE_CYCLE_COUNT
+        active_ids = self._active_source_ids()
+        self.num_sources.set(len(active_ids))
 
-        for i in range(1, n_sources + 1):
-            source_id = i
+        for source_id in active_ids:
             segment = tk.LabelFrame(self.sources_area, text="Source {}".format(source_id), padx=5, pady=5,
                                     bg=self.color_blue_aura_bg, fg=self.color_label_frame_fg, font=self.results_font)
             segment.pack(fill=tk.X, padx=2, pady=(0, 3))
-            new_src_config_dict = {}
+            new_src_config_dict = {'segment': segment}
             preserved_data = current_ui_values_cache.get(source_id, {})
 
             path_frame = tk.Frame(segment, bg=self.color_blue_aura_bg)
@@ -389,10 +822,16 @@ class xSourceDitherQCApp:
             prev_path = preserved_data.get('path_var_dither_value', "")
             new_src_config_dict['path_var_dither'] = tk.StringVar(value=prev_path)
             new_src_config_dict['path_var_dither_value'] = prev_path
-            tk.Entry(path_frame, textvariable=new_src_config_dict['path_var_dither'],
-                     bg=self.color_entry_bg, fg=self.color_text_dark, insertbackground=self.color_text_dark).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
-            tk.Button(path_frame, text="Browse...", command=lambda s=source_id: self.browse_dither_file(s),
-                      bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg).pack(side=tk.LEFT)
+            _dither_entry = tk.Entry(path_frame, textvariable=new_src_config_dict['path_var_dither'],
+                     bg=self.color_entry_bg, fg=self.color_text_dark, insertbackground=self.color_text_dark,
+                     disabledbackground=self.color_disabled_bg, disabledforeground=self.color_disabled_fg)
+            _dither_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+            _dither_btn = tk.Button(path_frame, text="Browse...", command=lambda s=source_id: self.browse_dither_file(s),
+                      bg=self.color_button_bg, fg=self.color_text_dark, activebackground=self.color_button_active_bg,
+                      disabledforeground=self.color_disabled_fg)
+            _dither_btn.pack(side=tk.LEFT)
+            new_src_config_dict['entry_dither'] = _dither_entry
+            new_src_config_dict['btn_dither'] = _dither_btn
             new_src_config_dict['status_label_dither'] = tk.Label(path_frame, text="Not Loaded", fg="gray", width=10, font=self.small_font, bg=self.color_blue_aura_bg)
             new_src_config_dict['status_label_dither'].pack(side=tk.LEFT, padx=5)
             new_src_config_dict['path_var_dither'].trace('w', lambda n, idx, m, var=new_src_config_dict['path_var_dither'], cfg=new_src_config_dict, key='path_var_dither_value': self._update_path_cache(cfg, key, var))
@@ -400,6 +839,115 @@ class xSourceDitherQCApp:
             self.source_configs[source_id] = new_src_config_dict
             if new_src_config_dict['path_var_dither'].get():
                 self.load_dither_pattern(source_id, new_src_config_dict['path_var_dither'].get())
+
+        self._apply_seq_source_state()
+
+    def _rebuild_source_rows_if_changed(self):
+        if not hasattr(self, 'sources_area') or self.sources_area is None:
+            return
+        want = self._active_source_ids()
+        have = sorted((self.source_configs or {}).keys())
+        if want != have:
+            self._build_ui_elements()
+
+    def _on_seq_source_changed(self):
+        """Sequence source switched: reset adaptive alignment, reload the preplot, regrey widgets."""
+        self._reset_adaptive_calibration()
+        self._adaptive_line_fingerprint = None
+        if self._is_preplot_mode():
+            path = ""
+            try:
+                path = self.preplot_path_var.get().strip()
+            except (tk.TclError, AttributeError):
+                path = ""
+            if path:
+                self.load_preplot(path)
+            else:
+                self._preplot = None
+                if self._preplot_status_label:
+                    self._preplot_status_label.config(text="Not Loaded", fg="gray")
+                self.log_message("Sequence source is Preplot: select a P1/11 preplot file.", "warning")
+        self._apply_seq_source_state()
+        self._update_shotpoint_check_source()
+
+    def _apply_seq_source_state(self):
+        """Show only the inputs the selected sequence source actually uses.
+
+        Rows are re-packed in a fixed order every time rather than restored in
+        place, so hiding and re-showing cannot scramble the layout."""
+        preplot_on = self._is_preplot_mode()
+
+        def _show(widget, **pack_opts):
+            if widget is None:
+                return
+            try:
+                widget.pack_forget()
+                widget.pack(**pack_opts)
+            except tk.TclError:
+                pass
+
+        def _hide(widget):
+            if widget is None:
+                return
+            try:
+                widget.pack_forget()
+            except tk.TclError:
+                pass
+
+        def _enable(widget):
+            if widget is None:
+                return
+            try:
+                widget.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+
+        # Gun Firing Sequence: source selector always, then whichever input it needs.
+        _show(self._seq_src_row, fill=tk.X, padx=5, pady=(3, 2))
+        _hide(self._preplot_row)
+        _hide(self._manual_row)
+        if preplot_on:
+            _show(self._preplot_row, fill=tk.X, padx=5, pady=(2, 5))
+            for w in self._preplot_widgets or []:
+                _enable(w)
+        else:
+            _show(self._manual_row, fill=tk.X, padx=5, pady=(2, 5))
+            for w in self._manual_seq_widgets or []:
+                _enable(w)
+
+        # Dither Pattern Reference only indexes .dither files, so it is moot
+        # once the preplot supplies its own reference shot.
+        _hide(self._pat_row)
+        _hide(self._gun_row)
+        if not preplot_on:
+            _show(self._pat_row, fill=tk.X, pady=(2, 6))
+            _enable(getattr(self, '_dither_pattern_ref_menu', None))
+        _show(self._gun_row, fill=tk.X, pady=(0, 2))
+
+        # Per-source .dither files, and the rule above them. The container is hidden as
+        # well: an emptied Tk frame keeps its last size, which would leave a dead gap.
+        _hide(self._sources_sep)
+        _hide(getattr(self, 'sources_area', None))
+        for cfg in (self.source_configs or {}).values():
+            if isinstance(cfg, dict):
+                _hide(cfg.get('segment'))
+        if not preplot_on:
+            try:
+                self.sources_area.pack_forget()
+                if self._postplot_frame is not None:
+                    self.sources_area.pack(fill=tk.X, pady=(5, 0), before=self._postplot_frame)
+                else:
+                    self.sources_area.pack(fill=tk.X, pady=(5, 0))
+                self._sources_sep.pack(fill=tk.X, pady=5, before=self.sources_area)
+            except (tk.TclError, AttributeError):
+                pass
+            for sid in sorted((self.source_configs or {}).keys()):
+                cfg = self.source_configs.get(sid)
+                if not isinstance(cfg, dict):
+                    continue
+                _show(cfg.get('segment'), fill=tk.X, padx=2, pady=(0, 3))
+                _enable(cfg.get('entry_dither'))
+                _enable(cfg.get('btn_dither'))
 
     def _update_path_cache(self, config_dict, value_key_in_dict, tk_string_var):
         try:
@@ -488,7 +1036,7 @@ class xSourceDitherQCApp:
             except OSError as e: self.log_message("Error creating directory {}: {}. Falling back to user home.".format(start_dir, e), "error"); start_dir = os.path.expanduser("~")
         initial_file = self.config_name_var.get() or self.default_config_name
         filepath = tkFileDialog.asksaveasfilename(
-            title="Select or Create xSourceDitherQC Configuration File",
+            title="Load an existing .xcfg, or go to a folder and type a new name to save there",
             initialdir=start_dir, initialfile=initial_file, defaultextension=".xcfg",
             filetypes=(("xSourceDitherQC Config", "*.xcfg"), ("Old Config files", "*.cfg"), ("All files", "*.*"))
         )
@@ -596,19 +1144,63 @@ class xSourceDitherQCApp:
                 self.log_text.config(state=tk.NORMAL)
                 tag = level if level in ["ok", "error", "warning", "info", "debug", "heading", "separator"] else "info"
                 self.log_text.insert(tk.END, message + "\n", tag)
+                self._trim_log()
                 self.log_text.see(tk.END)
                 self.log_text.config(state=tk.DISABLED)
         except tk.TclError: print "[Log-{}] {}".format(level, message)
 
     def run_command(self, cmd):
+        """Run a system command; None on any failure. Bounded by COMMAND_TIMEOUT_S so a hung
+        ex_lineque/tail costs one cycle instead of freezing the tool for good."""
         try:
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate(); retcode = proc.returncode
-            if retcode != 0: err_msg = stderr.strip() if stderr else "No stderr"; self.log_message("Error cmd '{}': RetCode={} | Err: {}".format(cmd, retcode, err_msg), "error"); return None
-            if stderr: self.log_message("Stderr from '{}': {}".format(cmd, stderr.strip()), "warning")
-            return stdout.strip()
-        except OSError as e: self.log_message("Sys Error: Cmd for '{}': {}".format(cmd, e), "error"); return None
-        except Exception as e: self.log_message("Unexpected err cmd '{}': {}".format(cmd, e), "error"); return None
+            # Own process group, so a timeout can kill the command itself and not just the shell.
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    preexec_fn=os.setsid)
+        except OSError as e:
+            self.log_message("Sys Error: Cmd for '{}': {}".format(cmd, e), "error"); return None
+        except Exception as e:
+            self.log_message("Unexpected err cmd '{}': {}".format(cmd, e), "error"); return None
+        box = {}
+        def _wait():
+            try:
+                box['out'] = proc.communicate()
+            except Exception as e:
+                box['exc'] = e
+        t = threading.Thread(target=_wait); t.daemon = True; t.start()
+        t.join(COMMAND_TIMEOUT_S)
+        if t.is_alive():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            t.join(2.0)
+            self.log_message("Error cmd '{}': no response after {}s - killed, will retry next cycle.".format(
+                cmd, COMMAND_TIMEOUT_S), "error")
+            return None
+        if 'exc' in box:
+            self.log_message("Unexpected err cmd '{}': {}".format(cmd, box['exc']), "error"); return None
+        stdout, stderr = box.get('out', ("", ""))
+        retcode = proc.returncode
+        if retcode != 0:
+            err_msg = stderr.strip() if stderr else "No stderr"
+            self.log_message("Error cmd '{}': RetCode={} | Err: {}".format(cmd, retcode, err_msg), "error"); return None
+        if stderr:
+            self.log_message("Stderr from '{}': {}".format(cmd, stderr.strip()), "warning")
+        return stdout.strip()
+
+    def _trim_log(self):
+        """Keep the check log bounded so a multi-day run cannot grow the Text widget without limit."""
+        try:
+            n_lines = int(self.log_text.index('end-1c').split('.')[0])
+            if n_lines > LOG_MAX_LINES:
+                self.log_text.config(state=tk.NORMAL)
+                self.log_text.delete('1.0', '{}.0'.format(n_lines - LOG_KEEP_LINES + 1))
+                self.log_text.config(state=tk.DISABLED)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
 
     def _read_shotcontroller_log_via_file(self, max_lines=20):
         """Last N lines without shell tail (e.g. missing tail or cmd failed)."""
@@ -691,6 +1283,7 @@ class xSourceDitherQCApp:
                     top_line_data['name'] = data_map.get('name', 'N/A')
                     top_line_data['preplot'] = data_map.get('preplot', 'N/A')
                     top_line_data['sequence'] = data_map.get('sequence', 'N/A')
+                    top_line_data['shooting_pattern'] = data_map.get('shootingPattern', 'N/A')
                     if 'upline' not in top_line_data:
                         raise ValueError("missing upline field")
                     if top_line_data['upline'] not in [0, 1]:
@@ -902,10 +1495,438 @@ class xSourceDitherQCApp:
         return shot_data
 
     def _get_pattern_ref_mode(self):
+        # Preplot mode supplies its own reference shot, so it overrides the menu selection.
+        if self._is_preplot_mode():
+            return PATTERN_REF_PREPLOT
         v = self.dither_pattern_reference_var.get()
         if v in PATTERN_REF_CHOICES:
             return v
         return PATTERN_REF_ANCHORED_SP
+
+    def _preplot_line_name_from(self, line_info):
+        """Preplot line name for a line-queue block.
+
+        Live ex_lineque (verified 2026-09-22): 'name' is the SEQUENCE name, e.g.
+        0406-06850P2002, and 'preplot' is the preplot LINE name, e.g. 6850_T1_315.
+        The preplot's line list is keyed by the latter."""
+        if not line_info:
+            return None
+        for key in ('preplot', 'name'):
+            v = line_info.get(key)
+            if v not in (None, '', 'N/A'):
+                return str(v)
+        return None
+
+    def _current_line_name(self):
+        return self._preplot_line_name_from(self._refresh_line_info_cache or self.current_line_info)
+
+    def _preplot_pattern_for_direction(self, is_upline, line_name=None):
+        """(pattern_id, entry) for this direction - the current line's own pair when
+        the preplot lists it, else the preplot default pair."""
+        pp = self._preplot
+        if not pp:
+            return None, None
+        if line_name is None:
+            line_name = self._current_line_name()
+        pair = pp['line_patterns'].get(line_name) if line_name else None
+        if pair is None:
+            pair = pp['default_pair']
+        pid = pair[0] if is_upline else pair[1]
+        return pid, pp['patterns'].get(pid)
+
+    def _is_preplot_mode(self):
+        try:
+            return self.seq_source_var.get() == SEQ_SOURCE_PREPLOT
+        except (tk.TclError, AttributeError):
+            return False
+
+    def _parse_sequence_text(self, txt):
+        """'1,2,3' -> [1, 2, 3]. Plain comma list, no expression evaluation."""
+        if txt is None:
+            return None, "empty"
+        parts = [p.strip() for p in str(txt).replace(';', ',').split(',') if p.strip()]
+        if not parts:
+            return None, "empty"
+        out = []
+        for p in parts:
+            try:
+                v = int(p)
+            except ValueError:
+                return None, "non-numeric entry '{}'".format(p)
+            if v < 1:
+                return None, "source numbers start at 1 (got {})".format(v)
+            out.append(v)
+        return out, "OK"
+
+    def _manual_cycle(self, is_upline):
+        var = self.up_sequence_var if is_upline else self.down_sequence_var
+        label = "Up sequence" if is_upline else "Down sequence"
+        try:
+            txt = var.get()
+        except (tk.TclError, AttributeError):
+            return None, "{} unreadable".format(label)
+        cyc, st = self._parse_sequence_text(txt)
+        if cyc is None:
+            return None, "{}: {}".format(label, st)
+        return cyc, "OK"
+
+    def _manual_anchor(self):
+        try:
+            txt = self.seq_anchor_var.get().strip()
+        except (tk.TclError, AttributeError):
+            return None, "Anchor SP unreadable"
+        try:
+            return int(txt), "OK"
+        except ValueError:
+            return None, "Anchor SP invalid: '{}'".format(txt)
+
+    def _active_source_ids(self):
+        """Source numbers actually used by the active cycle, ascending.
+
+        Drives which .dither files must be loaded, so a two-source job is not
+        held up waiting for a Source 3 file it will never fire."""
+        if self._is_preplot_mode():
+            if self._preplot and self._preplot.get('sources'):
+                return sorted(self._preplot['sources'])
+            return list(range(1, SOURCE_CYCLE_COUNT + 1))
+        ids = set()
+        for up in (True, False):
+            cyc, _st = self._manual_cycle(up)
+            if cyc:
+                ids.update(cyc)
+        if not ids:
+            return list(range(1, SOURCE_CYCLE_COUNT + 1))
+        return sorted(ids)
+
+    def _active_source_count(self):
+        """Sources actually in the cycle - preplot-derived, or counted from the manual cycle."""
+        if self._is_preplot_mode():
+            if self._preplot:
+                return self._preplot.get('num_srcs', SOURCE_CYCLE_COUNT)
+            return SOURCE_CYCLE_COUNT
+        up, _st = self._manual_cycle(True)
+        if up:
+            return len(set(up))
+        return SOURCE_CYCLE_COUNT
+
+    def browse_preplot_file(self):
+        cur = ""
+        try:
+            cur = self.preplot_path_var.get()
+        except (tk.TclError, AttributeError):
+            pass
+        start_dir = os.path.dirname(cur) if cur else ""
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = self.default_preplot_dir
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        filepath = tkFileDialog.askopenfilename(
+            title="Select preplot (P1/11) to read gun sequence and dither from",
+            initialdir=start_dir,
+            filetypes=(("P1/11 preplot", "*.p111"), ("P1 files", "*.p1*"), ("All files", "*.*")))
+        if filepath:
+            filepath = os.path.normpath(filepath)
+            try:
+                self.preplot_path_var.set(filepath)
+            except (tk.TclError, AttributeError):
+                pass
+            self.load_preplot(filepath)
+
+    def browse_postplot_file(self):
+        cur = ""
+        try:
+            cur = self.postplot_path_var.get()
+        except (tk.TclError, AttributeError):
+            pass
+        start_dir = os.path.dirname(cur) if cur else ""
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = self.default_preplot_dir
+        if not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        fp = tkFileDialog.askopenfilename(
+            title="Select acquired P1/11 postplot to QC", initialdir=start_dir,
+            filetypes=(("P1/11", "*.p111"), ("P1 files", "*.p1*"), ("All files", "*.*")))
+        if fp:
+            try:
+                self.postplot_path_var.set(os.path.normpath(fp))
+            except (tk.TclError, AttributeError):
+                pass
+
+    def _postplot_expected(self, sp, is_upline, line_name):
+        """(expected_source, expected_dither or None, status) for one acquired shot."""
+        if self._is_preplot_mode():
+            pp = self._preplot
+            if not pp:
+                return None, None, "Preplot not loaded"
+            pid, pat = self._preplot_pattern_for_direction(is_upline, line_name)
+            if pat is None:
+                return None, None, "no pattern {}".format(pid)
+            L = len(pat['seq'])
+            idx = (sp - pp['ref_shot']) % L if is_upline else (pp['ref_shot'] - sp) % L
+            dith = pat.get('dither')
+            if not dith:
+                _o, opat = self._preplot_pattern_for_direction(not is_upline, line_name)
+                dith = opat.get('dither') if opat else None
+            exp_d = float(dith[idx % len(dith)]) if dith else None
+            return int(pat['seq'][idx]), exp_d, "OK"
+        src, st = self.get_expected_source(sp, None, is_upline)
+        return src, None, st
+
+    def run_postplot_qc(self):
+        """Offline QC of an acquired P1/11 against the active sequence source. Never runs live."""
+        if self.running:
+            tkMessageBox.showwarning("Postplot QC", "Stop the live Source/Dither check first.")
+            return
+        try:
+            path = self.postplot_path_var.get().strip()
+        except (tk.TclError, AttributeError):
+            path = ""
+        if not path:
+            tkMessageBox.showwarning("Postplot QC", "Select a P1/11 postplot first.")
+            return
+        preplot_mode = self._is_preplot_mode()
+        if preplot_mode and not self._ensure_preplot_current(for_start=False):
+            tkMessageBox.showerror("Postplot QC", "Sequence Source is Preplot but no valid preplot is loaded.")
+            return
+        groups, st = parse_postplot_p111(path)
+        self.log_message("", "separator")
+        self.log_message("POSTPLOT DITHER QC - {}".format(os.path.basename(path)), "heading")
+        if groups is None:
+            self.log_message("  {}".format(st), "error")
+            self._set_postplot_status(False, "cannot read file")
+            return
+        if preplot_mode:
+            self.log_message("  Reference: preplot {} (ref shot {}, cycle {})".format(
+                os.path.basename(self._preplot['path']), self._preplot['ref_shot'], self._preplot['seq_len']), "info")
+        else:
+            up_c, _u = self._manual_cycle(True); dn_c, _d = self._manual_cycle(False)
+            self.log_message("  Reference: manual sequence up {} / down {} anchor {} - "
+                             "SOURCE SEQUENCE ONLY (dither needs Sequence Source = Preplot)".format(
+                                 ",".join(str(x) for x in up_c or []), ",".join(str(x) for x in dn_c or []),
+                                 self.seq_anchor_var.get()), "warning")
+
+        tol = self.float_tolerance
+        all_ok = True
+        total_sp = 0
+        for g in groups:
+            shots = g['shots']
+            n_sh = len(shots)
+            total_sp += n_sh
+            if g['is_upline'] is None:
+                self.log_message("  Sequence {} line {}: only {} shot - cannot tell direction, skipped".format(
+                    g['sequence'], g['line'], n_sh), "warning")
+                all_ok = False
+                continue
+            is_up = g['is_upline']
+            sps = [sh[0] for sh in shots]
+            lo, hi = min(sps), max(sps)
+            uniq = len(set(sps))
+            gaps = (hi - lo + 1) - uniq
+            dups = n_sh - uniq
+            self.log_message("  Sequence {}  line {}  {}  SP {} -> {}  ({} shots, {} missing SP, {} duplicate)".format(
+                g['sequence'], g['line'], "UPLINE" if is_up else "DOWNLINE",
+                sps[0], sps[-1], n_sh, gaps, dups), "info")
+            if preplot_mode:
+                pid, _pat = self._preplot_pattern_for_direction(is_up, g['line'])
+                listed = g['line'] in self._preplot['line_patterns']
+                self.log_message("  Preplot pattern {} for this direction{}".format(
+                    pid, "" if listed else "  (line NOT listed in preplot - using default pair)"), "info" if listed else "warning")
+                if not listed:
+                    all_ok = False
+
+            src_bad = []; dit_bad = []; dit_checked = 0; dit_missing = 0; max_res = 0.0; exp_err = None
+            for sp, src, dither, _t in shots:
+                exp_src, exp_d, est = self._postplot_expected(sp, is_up, g['line'])
+                if est != "OK":
+                    exp_err = est
+                    break
+                if exp_src != src:
+                    src_bad.append((sp, src, exp_src))
+                if exp_d is not None:
+                    if dither is None:
+                        dit_missing += 1
+                    else:
+                        dit_checked += 1
+                        res = abs(dither - exp_d)
+                        if res > max_res:
+                            max_res = res
+                        if res >= tol:
+                            dit_bad.append((sp, dither, exp_d))
+            if exp_err:
+                self.log_message("  Expected values unavailable: {}".format(exp_err), "error")
+                all_ok = False
+                continue
+
+            fired = []
+            for _sp, src, _d, _t in shots:
+                if src in fired:
+                    break
+                fired.append(src)
+            exp_cycle = []
+            for sp, _s, _d, _t in shots:
+                es, _ed, _st = self._postplot_expected(sp, is_up, g['line'])
+                if es in exp_cycle:
+                    break
+                exp_cycle.append(es)
+            self.log_message("  Source sequence (time order): fired {}   expected {}".format(
+                ",".join(str(x) for x in fired), ",".join(str(x) for x in exp_cycle)), "info")
+            if src_bad:
+                all_ok = False
+                self.log_message("  Source check: {} of {} WRONG".format(len(src_bad), n_sh), "error")
+                for sp, got, exp in src_bad[:10]:
+                    self.log_message("      SP {}: fired S{}, expected S{}".format(sp, got, exp), "error")
+                if len(src_bad) > 10:
+                    self.log_message("      ... {} more".format(len(src_bad) - 10), "error")
+            else:
+                self.log_message("  Source check: {}/{} OK".format(n_sh, n_sh), "ok")
+
+            if not preplot_mode:
+                self.log_message("  Dither check: skipped (manual mode)", "warning")
+            elif dit_checked == 0:
+                self.log_message("  Dither check: no Aimpoint Dither values in this postplot ({} shots without)".format(dit_missing), "error")
+                all_ok = False
+            else:
+                if dit_missing:
+                    self.log_message("  Dither: {} shots carry no Aimpoint Dither value".format(dit_missing), "warning")
+                    all_ok = False
+                if dit_bad:
+                    all_ok = False
+                    self.log_message("  Dither check: {} of {} WRONG (tol {:.3f} s, worst {:.3f} s)".format(
+                        len(dit_bad), dit_checked, tol, max_res), "error")
+                    for sp, got, exp in dit_bad[:10]:
+                        self.log_message("      SP {}: applied {:+.3f}, preplot {:+.3f}".format(sp, got, exp), "error")
+                    if len(dit_bad) > 10:
+                        self.log_message("      ... {} more".format(len(dit_bad) - 10), "error")
+                else:
+                    self.log_message("  Dither check: {}/{} OK, worst residual {:.3f} s (tol {:.3f})".format(
+                        dit_checked, dit_checked, max_res, tol), "ok")
+            if gaps or dups:
+                self.log_message("  Note: {} shotpoint(s) missing in range, {} duplicate(s) - "
+                                 "not counted as failure".format(gaps, dups), "warning")
+
+        self.log_message("  Total shotpoints checked: {}".format(total_sp), "info")
+        self._set_postplot_status(all_ok, "{} SP{}".format(total_sp, "" if preplot_mode else ", sequence only"))
+
+    def _set_postplot_status(self, ok, detail):
+        msg = "Postplot QC: {} ({})".format("PASS" if ok else "FAIL", detail)
+        self.log_message("RESULT: {}".format(msg), "ok" if ok else "error")
+        try:
+            self.status_label_text.set(msg)
+            self.status_label.config(fg="green" if ok else "red")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _preplot_crosscheck(self, line_info):
+        """Warn loudly if the line queue disagrees with the loaded preplot. Once per line."""
+        pp = self._preplot
+        if not pp or not line_info:
+            return
+        key = (line_info.get('name'), line_info.get('upline'), line_info.get('preplot'),
+               line_info.get('shooting_pattern'), pp.get('path'))
+        if key == getattr(self, '_preplot_crosscheck_key', None):
+            return
+        self._preplot_crosscheck_key = key
+        problems = []
+
+        name = self._preplot_line_name_from(line_info)
+        if name and pp['line_patterns'] and name not in pp['line_patterns']:
+            problems.append("preplot line '{}' is not in the loaded preplot ({} lines listed) - wrong preplot file?".format(
+                name, len(pp['line_patterns'])))
+
+        sp_txt = line_info.get('shooting_pattern')
+        is_up = line_info.get('upline') == 1
+        exp_pid, _pat = self._preplot_pattern_for_direction(is_up, name)
+        try:
+            lq_pid = int(str(sp_txt).strip())
+        except (ValueError, TypeError):
+            lq_pid = None
+        if lq_pid is not None and exp_pid is not None and lq_pid != exp_pid:
+            if lq_pid in pp['patterns']:
+                problems.append("line queue shooting pattern {} but preplot expects {} for {} on this line".format(
+                    lq_pid, exp_pid, "upline" if is_up else "downline"))
+            else:
+                problems.append("line queue shooting pattern {} is not in the preplot (has {})".format(
+                    lq_pid, ", ".join(str(k) for k in sorted(pp['patterns']))))
+
+        if problems:
+            for msg in problems:
+                self.log_message("PREPLOT CHECK: " + msg, "error")
+            self.log_message("PREPLOT CHECK: expected source/dither below may be for the WRONG preplot.", "error")
+        else:
+            self.log_message("Preplot check OK: sequence {} on preplot line {} ({}), pattern {}, ref shot {}.".format(
+                line_info.get('name'), name, "upline" if is_up else "downline", exp_pid, pp['ref_shot']), "info")
+
+    def _ensure_preplot_current(self, for_start=False):
+        """Make _preplot match the path in the entry. Returns True when a usable preplot is held.
+
+        Called on Return / focus-out of the path entry and again on Start, so a path that
+        was typed rather than browsed can never leave a stale preplot behind."""
+        try:
+            path = self.preplot_path_var.get().strip()
+        except (tk.TclError, AttributeError):
+            path = ""
+        if not path:
+            self._preplot = None
+            if self._preplot_status_label:
+                self._preplot_status_label.config(text="Not Loaded", fg="gray")
+            if for_start:
+                tkMessageBox.showerror("Config Error", "Sequence Source is Preplot but no preplot file is set.")
+            return False
+        if self._preplot is None or self._preplot.get('path') != path:
+            if not self.load_preplot(path):
+                if for_start:
+                    tkMessageBox.showerror("Config Error", "Preplot could not be loaded:\n{}\nSee log.".format(path))
+                return False
+        if for_start and not self._is_gun_sequence_only():
+            has_dither = any(p.get('dither') for p in self._preplot['patterns'].values())
+            if not has_dither:
+                tkMessageBox.showerror(
+                    "Config Error",
+                    "Preplot has no jitteringAtIndex dither values.\n"
+                    "Tick 'Source Sequence Check Only' or switch Sequence Source to Manual with .dither files.")
+                return False
+        return True
+
+    def load_preplot(self, filepath):
+        data, status = parse_preplot(filepath)
+        lbl = getattr(self, '_preplot_status_label', None)
+        if data is None:
+            self._preplot = None
+            if filepath:
+                self.log_message("Preplot load failed: {}".format(status), "error")
+            if lbl:
+                lbl.config(text="Load Err", fg="red")
+            return False
+        self._preplot = data
+        if data.get('multi_pattern'):
+            self.log_message(
+                "Warn: preplot declares more than one shooting-pattern pair; using {}/{}.".format(
+                    data['pat_inc'], data['pat_dec']), "warning")
+        ncyc = data['num_srcs']
+        self.log_message(
+            "Preplot loaded: {} - ref shot {}, cycle length {}, {} sources, "
+            "up {} (pattern {}) / down {} (pattern {}), dither {}, {} lines.".format(
+                os.path.basename(filepath), data['ref_shot'], data['seq_len'], ncyc,
+                ",".join(str(v) for v in data['inc_seq'][:ncyc]), data['pat_inc'],
+                ",".join(str(v) for v in data['dec_seq'][:ncyc]), data['pat_dec'],
+                "{} values".format(len(data['dither'])) if data.get('dither') else "NONE",
+                len(data['line_patterns'])),
+            "info")
+        self._preplot_crosscheck_key = None
+        if not data.get('dither'):
+            self.log_message(
+                "Warn: preplot has no jitteringAtIndex values; dither QC needs .dither files or "
+                "Source Sequence Check Only.", "warning")
+        if lbl:
+            lbl.config(text="Loaded", fg="blue")
+        self._rebuild_source_rows_if_changed()
+        return True
+
+    def _format_triple_start_rows(self, starts):
+        """'S1=4 S2=4 S3=4' for however many sources the active cycle actually uses."""
+        if not starts:
+            return "-"
+        return " ".join("S{}={}".format(sid, starts[sid]) for sid in sorted(starts))
 
     def _reset_adaptive_calibration(self):
         self._adaptive_triple_start_row = {1: None, 2: None, 3: None}
@@ -1048,7 +2069,7 @@ class xSourceDitherQCApp:
         v3 = hist[2]['applied_dither']
         tol = max(self.float_tolerance, 0.0005)
         new_starts = {}
-        for sid in range(1, SOURCE_CYCLE_COUNT + 1):
+        for sid in self._active_source_ids():
             pat = self.dither_patterns.get(sid)
             if not pat or not isinstance(pat, list) or len(pat) < 3:
                 return
@@ -1060,9 +2081,9 @@ class xSourceDitherQCApp:
         self._adaptive_sp_base = int(sp1)
         self._adaptive_calibrated = True
         self.log_message(
-            "Adaptive: matched Trinav triple ({:.3f}, {:.3f}, {:.3f}) at SP {}–{} in files (row0 S1={} S2={} S3={}); "
+            "Adaptive: matched Trinav triple ({:.3f}, {:.3f}, {:.3f}) at SP {}–{} in files (row0 {}); "
             "QC row follows line (file top→bottom); next SP expects row+3 vs triple.".format(
-                v1, v2, v3, sp1, sp3, new_starts[1], new_starts[2], new_starts[3]),
+                v1, v2, v3, sp1, sp3, self._format_triple_start_rows(new_starts)),
             "info")
 
     def get_expected_dither(self, shot_number, is_upline, anchored_shot, line_info):
@@ -1076,6 +2097,28 @@ class xSourceDitherQCApp:
             sn = int(shot_number)
         except (TypeError, ValueError):
             return None, "Invalid shot number", None, None, None, None
+
+        if mode == PATTERN_REF_PREPLOT:
+            pp = self._preplot
+            if not pp:
+                return None, "Preplot not loaded", None, None, None, None
+            pid, pat = self._preplot_pattern_for_direction(is_upline)
+            dith = pat.get('dither') if pat else None
+            if not dith:
+                # Fall back to the other direction's jitter only if this pattern has none.
+                _opid, opat = self._preplot_pattern_for_direction(not is_upline)
+                dith = opat.get('dither') if opat else None
+            if not dith:
+                return None, "Preplot carries no dither values", None, None, None, None
+            pp_len = len(dith)
+            ref = pp['ref_shot']
+            row_idx = (sn - ref) if is_upline else (ref - sn)
+            idx_wrapped = row_idx % pp_len
+            try:
+                return float(dith[idx_wrapped]), "OK", exp_src, row_idx, idx_wrapped, pp_len
+            except (ValueError, TypeError, IndexError) as e:
+                self.log_message("Error reading preplot dither [{}]: {}".format(idx_wrapped, e), "error")
+                return None, "Preplot dither read error", None, None, None, None
 
         row_idx = None
         ref_shot = None
@@ -1148,33 +2191,51 @@ class xSourceDitherQCApp:
             return None, "Pattern read error", None, None, None, None
 
     def get_expected_source(self, shot_number, anchored_shot, is_upline):
-        """3-source cycle from *current* shot_number (from log), not line-queue Anchored shot.
-        index = (shot_number - SOURCE_CYCLE_ANCHOR_SP) % 3  -> 0,1,2.
-        Upline (is_upline True): 0->S1, 1->S2, 2->S3. Downline: 0->S3, 1->S2, 2->S1.
-        Example: shot 1006, downline -> index 2 -> Source 1. anchored_shot unused here."""
+        """Expected source for a shotpoint, from whichever sequence source is selected.
+
+        Preplot: idx = (SP - ref) mod L upline, (ref - SP) mod L downline; source = seq[idx].
+        Manual:  idx = (SP - anchor) mod len(cycle); source = cycle[idx].
+        The manual defaults (up 1,2,3 / down 3,2,1 from SP 1001) reproduce the original
+        hardcoded rule exactly, so an existing config behaves as before.
+        anchored_shot is unused - the cycle keys off the shot number itself."""
         _ = anchored_shot
-        try:
-            num_sources_val = self.num_sources.get()
-            if num_sources_val <= 0:
-                return None, "Invalid Source Count ({})".format(num_sources_val)
-        except (tk.TclError, ValueError) as e:
-            return None, "Invalid GUI Params (SrcCount): {}".format(e)
-        if num_sources_val != SOURCE_CYCLE_COUNT:
-            return None, "Need {} sources for SP cycle (have {})".format(SOURCE_CYCLE_COUNT, num_sources_val)
         try:
             shot_n = int(shot_number)
         except (TypeError, ValueError):
             return None, "Invalid shot number"
-        idx = (shot_n - SOURCE_CYCLE_ANCHOR_SP) % SOURCE_CYCLE_COUNT
-        if is_upline:
-            expected_source_id = idx + 1
-        else:
-            expected_source_id = (3, 2, 1)[idx]
-        return expected_source_id, "OK"
+
+        if self._is_preplot_mode():
+            pp = self._preplot
+            if not pp:
+                return None, "Preplot not loaded"
+            pid, pat = self._preplot_pattern_for_direction(is_upline)
+            if pat is None:
+                return None, "Preplot has no pattern {} for this direction".format(pid)
+            seq = pat['seq']
+            seq_len = len(seq)
+            if seq_len <= 0:
+                return None, "Preplot pattern {} sequence empty".format(pid)
+            ref = pp['ref_shot']
+            idx = (shot_n - ref) % seq_len if is_upline else (ref - shot_n) % seq_len
+            try:
+                return int(seq[idx]), "OK"
+            except (IndexError, ValueError, TypeError):
+                return None, "Preplot sequence read error at index {}".format(idx)
+
+        cycle, cyc_st = self._manual_cycle(is_upline)
+        if cycle is None:
+            return None, cyc_st
+        anchor, anc_st = self._manual_anchor()
+        if anchor is None:
+            return None, anc_st
+        idx = (shot_n - anchor) % len(cycle)
+        return int(cycle[idx]), "OK"
 
     def check_first_dither_row_matches_reference(self, line_info):
         """Anchored SP: row0 = dither at anchor; Production FSP / Adaptive: alignment check N/A here."""
         mode = self._get_pattern_ref_mode()
+        if mode == PATTERN_REF_PREPLOT:
+            return True, "N/A (preplot supplies the reference shot)", "Preplot"
         if mode == PATTERN_REF_ADAPTIVE:
             return True, "N/A (Adaptive)", "Adaptive"
         if mode == PATTERN_REF_PRODUCTION_FSP:
@@ -1189,7 +2250,7 @@ class xSourceDitherQCApp:
             return False, "invalid anchored shot", "anchor SP"
 
         bad = []
-        for sid in range(1, SOURCE_CYCLE_COUNT + 1):
+        for sid in self._active_source_ids():
             pat = self.dither_patterns.get(sid)
             if pat is None or not isinstance(pat, list) or len(pat) < 1:
                 bad.append("S{}: not loaded".format(sid))
@@ -1203,10 +2264,16 @@ class xSourceDitherQCApp:
         if gun_only:
             return "Pattern Index Ref in Use: — (gun sequence only)"
         mode = self._get_pattern_ref_mode()
+        if mode == PATTERN_REF_PREPLOT:
+            pp = self._preplot
+            if pp:
+                return "Pattern Index Ref in Use: Preplot ref shot {} (cycle {} SPs)".format(
+                    pp['ref_shot'], pp['seq_len'])
+            return "Pattern Index Ref in Use: Preplot - (not loaded)"
         if mode == PATTERN_REF_ADAPTIVE:
             if self._adaptive_calibrated:
-                return "Pattern Index Ref in Use: Adaptive (locked; triple starts at file row S1={} S2={} S3={})".format(
-                    self._adaptive_triple_start_row[1], self._adaptive_triple_start_row[2], self._adaptive_triple_start_row[3])
+                return "Pattern Index Ref in Use: Adaptive (locked; triple starts at file row {})".format(
+                    self._format_triple_start_rows(self._adaptive_triple_start_row))
             return "Pattern Index Ref in Use: Adaptive (calibrating — need 3 consecutive SPs with Trinav dither in log)"
         if mode == PATTERN_REF_ANCHORED_SP:
             anc = line_info.get('anchored_shot') if line_info else None
@@ -1225,6 +2292,29 @@ class xSourceDitherQCApp:
             return False
 
     def perform_check(self):
+        """Timer entry point. Whatever happens inside, the loop is re-armed while running."""
+        if not self.running:
+            return
+        if self.timer_id:
+            # We are the running tick: drop any stale pending one so two chains can never coexist.
+            try:
+                self.root.after_cancel(self.timer_id)
+            except tk.TclError:
+                pass
+            self.timer_id = None
+        try:
+            self._perform_check_inner()
+        except Exception as e:
+            tb = traceback.format_exc().strip().splitlines()
+            self.log_message("Internal error in check loop: {!r} ({}) - continuing.".format(e, tb[-2].strip() if len(tb) > 1 else "?"), "error")
+            try:
+                self.status_label_text.set("Error: internal - retrying"); self.status_label.config(fg="red")
+            except tk.TclError:
+                pass
+            if self.running and self.timer_id is None:
+                self.timer_id = self.root.after(self.default_retry_interval_ms, self.perform_check)
+
+    def _perform_check_inner(self):
         if not self.running: return
         gun_only = self._is_gun_sequence_only()
         line_info_output = self.run_command(self.lineque_cmd); line_info = self.parse_lineque_output(line_info_output)
@@ -1243,6 +2333,8 @@ class xSourceDitherQCApp:
             self._adaptive_line_fingerprint = self._line_identity_tuple(line_info)
         self._apply_parsed_lineque_to_param_display(line_info)
         self._update_shotpoint_check_source()
+        if self._is_preplot_mode():
+            self._preplot_crosscheck(line_info)
         is_upline = line_info.get('upline') == 1; direction_str = "Upline" if is_upline else "Downline"; anchored_shot = line_info.get('anchored_shot', None); line_name = line_info.get('name', 'N/A')
         if anchored_shot is None: self.log_message("Error: Missing Anchor SP info.", "error"); self.status_label_text.set("Error: Missing Anchor SP"); self.status_label.config(fg="red"); self._reset_in_use_labels(); self.timer_id = self.root.after(self.default_retry_interval_ms, self.perform_check); return
         tail_lines = 120 if (not gun_only and self._get_pattern_ref_mode() == PATTERN_REF_ADAPTIVE) else 20
@@ -1287,8 +2379,14 @@ class xSourceDitherQCApp:
             elif dither_status == "OK" and expected_dither is not None:
                 dither_file_val_str = "{:.3f}".format(expected_dither)
                 if row_from_ref is not None and dither_src is not None and file_row_idx is not None and pat_len:
-                    extra = " (S{}, step {} -> file line {} of {})".format(
-                        dither_src, row_from_ref, file_row_idx + 1, pat_len)
+                    if self._get_pattern_ref_mode() == PATTERN_REF_PREPLOT:
+                        # row_from_ref is (ref-SP) on a downline; show plain shots-from-ref.
+                        extra = " (S{}, {} shots from ref {} -> preplot index {} of {})".format(
+                            dither_src, abs(row_from_ref), self._preplot['ref_shot'] if self._preplot else '?',
+                            file_row_idx, pat_len)
+                    else:
+                        extra = " (S{}, step {} -> file line {} of {})".format(
+                            dither_src, row_from_ref, file_row_idx + 1, pat_len)
                     if row_from_ref >= pat_len:
                         extra += " [wrap/repeat]"
                     dither_file_val_str += extra
@@ -1332,7 +2430,8 @@ class xSourceDitherQCApp:
                 self.log_text.insert(tk.END, "  Trinav Applied Dither: — (not compared)\n")
         else:
             self.log_text.insert(tk.END, "  Trinav Applied Dither: {:.3f}\n".format(applied_dither))
-        self.log_text.insert(tk.END, "  Dither from File: {} ".format(dither_file_val_str))
+        self.log_text.insert(tk.END, "  Dither from {}: {} ".format(
+            "Preplot" if self._get_pattern_ref_mode() == PATTERN_REF_PREPLOT else "File", dither_file_val_str))
         if dither_check_status_str == "WAIT":
             _dither_tag = "info"
         elif dither_match:
@@ -1374,6 +2473,7 @@ class xSourceDitherQCApp:
                 fail_reason.append("Pattern alignment MISMATCH")
             status_msg = "SP: {} QC FAIL: {}".format(shot_num, ", ".join(fail_reason))
             self.status_label_text.set(status_msg); self.status_label.config(fg="red")
+        self._trim_log()
         if self.running: self.timer_id = self.root.after(next_interval_ms, self.perform_check)
 
     def _reset_in_use_labels(self):
@@ -1404,18 +2504,19 @@ class xSourceDitherQCApp:
     def start_checking(self):
         if self.running:
             return
-        num_src = SOURCE_CYCLE_COUNT
-        self.num_sources.set(num_src)
-        if not hasattr(self, 'source_configs') or len(self.source_configs) != num_src:
-            self._build_ui_elements()
+        self._rebuild_source_rows_if_changed()
         patterns_ok = True
         files_missing = False
-        if not self._is_gun_sequence_only():
-            for i in range(1, num_src + 1):
+        if self._is_preplot_mode():
+            if not self._ensure_preplot_current(for_start=True):
+                return
+        elif not self._is_gun_sequence_only():
+            for i in self._active_source_ids():
                 src_conf_dict = self.source_configs.get(i)
                 if not src_conf_dict:
                     patterns_ok = False
-                    self.log_message("Error: Config dict missing S{} in start.".format(i), "error")
+                    files_missing = True
+                    self.log_message("Error: no dither file row for Source {} named in the sequence.".format(i), "error")
                     continue
                 path_d = src_conf_dict['path_var_dither'].get() if 'path_var_dither' in src_conf_dict else src_conf_dict.get('path_var_dither_value', '')
                 if not path_d:
@@ -1438,6 +2539,7 @@ class xSourceDitherQCApp:
         if self.params_frame: self.params_frame.pack_forget()
         self.log_message("Starting {}...".format("Source Sequence check" if self._is_gun_sequence_only() else "Source/Dither check"), "info")
         self.status_label_text.set("Starting...")
+        self.status_label_text.set("Starting...")
         self.status_label.config(fg="blue")
         self.current_line_info = {}; self._reset_in_use_labels(); self.perform_check()
 
@@ -1448,11 +2550,12 @@ class xSourceDitherQCApp:
         self.start_button.config(state=tk.NORMAL, bg=self.color_button_bg)
         self.stop_button.config(state=tk.DISABLED, bg=self.color_disabled_bg if self.color_disabled_bg else self.color_button_bg)
         if self.params_frame:
-            config_frame_ref = None
-            for w in self.root.winfo_children():
-                if isinstance(w, tk.Frame) and self.config_name_entry in w.winfo_children(): config_frame_ref = w; break
-            if config_frame_ref: self.params_frame.pack(fill=tk.X, padx=5, pady=5, after=config_frame_ref)
-            else: self.params_frame.pack(fill=tk.X, padx=5, pady=5)
+            # before=rt_frame keeps the log as the lowest-priority block, so a short window
+            # squeezes the log and never the Start/Stop buttons.
+            try:
+                self.params_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5, before=self._rt_frame)
+            except (tk.TclError, AttributeError):
+                self.params_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         self._reset_in_use_labels()
         self.log_message("Source/Dither check stopped.", "info")
         self.status_label_text.set("Stopped")
@@ -1508,6 +2611,17 @@ class xSourceDitherQCApp:
                 config_parser.set('General', 'gun_sequence_only', 1 if self.gun_sequence_only_var.get() else 0)
             except tk.TclError:
                 config_parser.set('General', 'gun_sequence_only', '0')
+            for _key, _var, _fallback in (
+                    ('sequence_source', 'seq_source_var', SEQ_SOURCE_MANUAL),
+                    ('preplot_file', 'preplot_path_var', ''),
+                    ('postplot_file', 'postplot_path_var', ''),
+                    ('up_sequence', 'up_sequence_var', DEFAULT_UP_SEQUENCE),
+                    ('down_sequence', 'down_sequence_var', DEFAULT_DOWN_SEQUENCE),
+                    ('sequence_anchor_sp', 'seq_anchor_var', str(SOURCE_CYCLE_ANCHOR_SP))):
+                try:
+                    config_parser.set('General', _key, getattr(self, _var).get())
+                except (tk.TclError, AttributeError):
+                    config_parser.set('General', _key, _fallback)
             if hasattr(self, 'source_configs'):
                 for source_id, src_config_dict in self.source_configs.items():
                     if isinstance(src_config_dict, dict):
@@ -1625,9 +2739,26 @@ class xSourceDitherQCApp:
                             self.gun_sequence_only_var.set(1 if g else 0)
                         except ValueError:
                             pass
+                    # Sequence inputs first, source last: the trace on sequence_source
+                    # loads the preplot and regreys the widgets once everything is in place.
+                    for _key, _var, _default in (
+                            ('up_sequence', self.up_sequence_var, DEFAULT_UP_SEQUENCE),
+                            ('down_sequence', self.down_sequence_var, DEFAULT_DOWN_SEQUENCE),
+                            ('sequence_anchor_sp', self.seq_anchor_var, str(SOURCE_CYCLE_ANCHOR_SP)),
+                            ('preplot_file', self.preplot_path_var, ''),
+                            ('postplot_file', self.postplot_path_var, '')):
+                        if config_parser_obj.has_option('General', _key):
+                            _var.set(config_parser_obj.get('General', _key).strip())
+                        else:
+                            _var.set(_default)
+                    if config_parser_obj.has_option('General', 'sequence_source'):
+                        _ss = config_parser_obj.get('General', 'sequence_source').strip()
+                        self.seq_source_var.set(_ss if _ss in SEQ_SOURCE_CHOICES else SEQ_SOURCE_MANUAL)
+                    else:
+                        self.seq_source_var.set(SEQ_SOURCE_MANUAL)
+                    self._rebuild_source_rows_if_changed()
 
-                n_src_in_ui = SOURCE_CYCLE_COUNT
-                for sid_iterator in range(1, n_src_in_ui + 1):
+                for sid_iterator in sorted(self.source_configs.keys()):
                     section_name_in_cfg = 'Source_{}'.format(sid_iterator)
                     src_dict_in_app = self.source_configs.get(sid_iterator)
                     if not src_dict_in_app:
@@ -1669,6 +2800,12 @@ class xSourceDitherQCApp:
                 self.num_sources.set(SOURCE_CYCLE_COUNT)
                 self.shot_increment_var.set(1)
                 self.dither_patterns.clear()
+                self._preplot = None
+                self.up_sequence_var.set(DEFAULT_UP_SEQUENCE)
+                self.down_sequence_var.set(DEFAULT_DOWN_SEQUENCE)
+                self.seq_anchor_var.set(str(SOURCE_CYCLE_ANCHOR_SP))
+                self.preplot_path_var.set("")
+                self.seq_source_var.set(SEQ_SOURCE_MANUAL)
                 self._build_ui_elements()
                 self._reset_in_use_labels()
                 self.refresh_params_from_system()
